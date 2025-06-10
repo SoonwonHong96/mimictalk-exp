@@ -177,6 +177,10 @@ class LoRATrainer(nn.Module):
         inp = self.inp
         from modules.real3d.secc_img2plane_torso import OSAvatarSECC_Img2plane, OSAvatarSECC_Img2plane_Torso
         hp = set_hparams(f"{model_dir}/config.yaml", print_hparams=False, global_hparams=True)
+        
+        # FIX: Manually update hparams to sync command-line args with the model's config
+        hparams['mouth_encode_mode'] = self.inp.get('mouth_encode_mode', 'none')
+        
         hp['htbsr_head_threshold'] = 1.0
         self.neural_rendering_resolution = hp['neural_rendering_resolution']
         if 'torso' in hp['task_cls'].lower():
@@ -186,6 +190,29 @@ class LoRATrainer(nn.Module):
             self.torso_mode = False
             model = OSAvatarSECC_Img2plane(hp=hp, lora_args=self.lora_args)
         mark_only_lora_as_trainable(model, bias='none')
+
+        mode = self.inp.get('mouth_encode_mode', 'none')
+        if mode != 'none':
+            print(f"| Mouth encode mode is '{mode}'. Unfreezing related modules for training.")
+            sr_module = model.superresolution
+            if mode == 'concat':
+                for p in sr_module.mouth_encoder_concat.parameters(): p.requires_grad = True
+                for p in sr_module.fuse_mouth_conv.parameters(): p.requires_grad = True
+            elif mode == 'add':
+                for p in sr_module.mouth_encoder_add.parameters(): p.requires_grad = True
+            elif mode == 'style_latent':
+                for p in sr_module.mouth_encoder_style.parameters(): p.requires_grad = True
+                for p in sr_module.style_fusion_layer.parameters(): p.requires_grad = True
+            elif mode == 'adain':
+                for p in sr_module.mouth_encoder_adain.parameters(): p.requires_grad = True
+                for p in sr_module.adain_param_generator.parameters(): p.requires_grad = True
+            elif mode == 'gated':
+                for p in sr_module.mouth_encoder_gated.parameters(): p.requires_grad = True
+                for p in sr_module.gating_network.parameters(): p.requires_grad = True
+            elif mode == 'film':
+                for p in sr_module.mouth_encoder_film.parameters(): p.requires_grad = True
+                for p in sr_module.film_generator.parameters(): p.requires_grad = True
+
         lora_ckpt_path = os.path.join(inp['work_dir'], 'checkpoint.ckpt')
         if os.path.exists(lora_ckpt_path):
             self.learnable_triplane = nn.Parameter(torch.zeros([1, 3, model.triplane_hid_dim*model.triplane_depth, 256, 256]).float().cuda(), requires_grad=True)
@@ -276,7 +303,7 @@ class LoRATrainer(nn.Module):
         lm2ds = WH * self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cpu().numpy()
         
         mouth_ref_img = None
-        if self.inp.get('mouth_encode', False):
+        if self.inp.get('mouth_encode_mode', 'none') != 'none':
             # Using 68 landmarks, upper inner lip is 62, lower inner lip is 66.
             # We use the y-coordinate to measure vertical distance.
             lip_dists = lm2ds[:, 66, 1] - lm2ds[:, 62, 1]
@@ -289,11 +316,27 @@ class LoRATrainer(nn.Module):
                 mouth_ref_img_name = f'data/processed/videos/{video_id}/gt_imgs/{format(mouth_open_idx, "08d")}.jpg'
             
             if os.path.exists(mouth_ref_img_name):
-                loaded_img_bgr = cv2.imread(mouth_ref_img_name)
-                debug_save_path = os.path.join(self.inp['work_dir'], 'mouth_ref_img_for_debug.png')
-                cv2.imwrite(debug_save_path, loaded_img_bgr)
-                print(f"| Saved mouth reference image for debugging to: {debug_save_path}")
-                mouth_ref_img = torch.tensor(loaded_img_bgr[..., ::-1] / 127.5 - 1).permute(2, 0, 1).float()
+                full_ref_img_bgr = cv2.imread(mouth_ref_img_name)
+                
+                # Get the y-coordinate of the nose tip (landmark 33) and crop below it.
+                nose_tip_y = lm2ds[mouth_open_idx, 33, 1]
+                crop_y_start = int(nose_tip_y)
+                
+                # Ensure crop start is within image bounds
+                if crop_y_start < 0: crop_y_start = 0
+                if crop_y_start >= full_ref_img_bgr.shape[0]: crop_y_start = full_ref_img_bgr.shape[0] - 1
+                
+                # Create a black background and copy the lower part of the face onto it.
+                cropped_img_bgr = np.zeros_like(full_ref_img_bgr)
+                cropped_img_bgr[crop_y_start:, :, :] = full_ref_img_bgr[crop_y_start:, :, :]
+
+                # Convert the cropped image to a tensor for the model.
+                mouth_ref_img = torch.tensor(cropped_img_bgr[..., ::-1].copy() / 127.5 - 1).permute(2, 0, 1).float()
+                
+                # Save the chosen CROPPED image for verification.
+                save_path = os.path.join(self.inp['work_dir'], 'mouth_reference_frame_cropped.png')
+                cv2.imwrite(save_path, cropped_img_bgr)
+                print(f"| Saved CROPPED mouth reference frame to {save_path}")
             else:
                 print(f"| WARNING: Could not find mouth reference image: {mouth_ref_img_name}")
 
@@ -301,6 +344,25 @@ class LoRATrainer(nn.Module):
         kps = self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cuda()
         kps = (kps-0.5) / 0.5 # rescale to -1~1
         kps = torch.cat([kps, torch.zeros([*kps.shape[:-1], 1]).cuda()], dim=-1)
+        
+        # Create binary mouth masks from landmarks
+        mouth_masks = []
+        for i in range(len(lm2ds)):
+            # Landmarks 48 to 67 correspond to the outer and inner lips.
+            mouth_lms = lm2ds[i, 48:68, :2]
+            
+            # Create a convex hull from the mouth landmarks to define the mask region.
+            hull = cv2.convexHull(mouth_lms.astype(np.int32))
+            
+            # Draw the filled hull on a black image to create the binary mask.
+            mask = np.zeros((WH, WH), dtype=np.uint8)
+            cv2.drawContours(mask, [hull], 0, (255), -1)
+            
+            # Convert to a float tensor with values 0.0 or 1.0
+            mouth_masks.append(torch.from_numpy(mask > 0).float())
+        
+        mouth_masks = torch.stack(mouth_masks).unsqueeze(1) # Shape: [T, 1, H, W]
+        
         camera_ret = get_eg3d_convention_camera_pose_intrinsic({'euler': torch.tensor(coeff_dict['euler']).reshape([-1,3]), 'trans': torch.tensor(coeff_dict['trans']).reshape([-1,3])})
         c2w, intrinsics = camera_ret['c2w'], camera_ret['intrinsics']
         cameras = torch.tensor(np.concatenate([c2w.reshape([-1,16]), intrinsics.reshape([-1,9])], axis=-1)).cuda()
@@ -336,6 +398,7 @@ class LoRATrainer(nn.Module):
             'segmaps': segmaps,
             'kps': kps,
             'mouth_ref_img': mouth_ref_img.cuda() if mouth_ref_img is not None else None,
+            'mouth_masks': mouth_masks.cuda(),
         }
         self.ds = ds
         return ds
@@ -343,7 +406,12 @@ class LoRATrainer(nn.Module):
     def training_loop(self, inp):
         trainer = self
         video_id = self.ds['video_id']
-        lora_params = [p for k, p in self.secc2video_model.named_parameters() if 'lora_' in k]
+        
+        # Collect all parameters that require gradients for the optimizer
+        main_model_trainable_params = [p for p in self.secc2video_model.parameters() if p.requires_grad]
+        num_main_params = sum(p.numel() for p in main_model_trainable_params)
+        print(f"| Found {num_main_params} trainable parameters in the main model.")
+
         self.criterion_lpips = lpips.LPIPS(net='alex',lpips=True).cuda()
         self.logger = SummaryWriter(log_dir=inp['work_dir'])
         if not hasattr(self, 'learnable_triplane'):
@@ -354,10 +422,12 @@ class LoRATrainer(nn.Module):
             cano_plane = self.secc2video_model.cal_cano_plane(img.unsqueeze(0)) # [1, 3, CD, h, w]
             self.learnable_triplane.data = cano_plane.data
             self.secc2video_model._last_cano_planes = self.learnable_triplane
-        if len(lora_params) == 0:
+        if len(main_model_trainable_params) == 0:
+            # Case where only the triplane is being trained
             self.optimizer = torch.optim.AdamW([self.learnable_triplane], lr=inp['lr_triplane'], weight_decay=0.01, betas=(0.9,0.98))
         else:
-            self.optimizer = torch.optim.Adam(lora_params, lr=inp['lr'], betas=(0.9,0.98))
+            # Case where LoRA and/or SR parameters are being trained
+            self.optimizer = torch.optim.Adam(main_model_trainable_params, lr=inp['lr'], betas=(0.9,0.98))
             self.optimizer.add_param_group({
                 'params': [self.learnable_triplane],
                 'lr': inp['lr_triplane'],
@@ -418,6 +488,7 @@ class LoRATrainer(nn.Module):
             drv_lip_rects = []
             kp_src = []
             kp_drv = []
+            mouth_masks_for_batch = []
             for di in drv_idx:
                 # 读取target image
                 if self.torso_mode:
@@ -457,6 +528,10 @@ class LoRATrainer(nn.Module):
                     segmap = torch.from_numpy(decode_segmap_mask_from_image(seg_img)) # [6, H, W]
                     self.ds['segmaps'][di] = segmap
                 segmaps.append(self.ds['segmaps'][di])
+                
+                # Get the pre-computed mouth mask for the current frame
+                mouth_masks_for_batch.append(self.ds['mouth_masks'][di])
+                
                 _, secc_color = self.secc_renderer(ids[0:1], exps[di:di+1], zero_eulers[0:1], zero_trans[0:1])
                 drv_secc_colors.append(secc_color)
                 drv_lip_rects.append(self.ds['lip_rects'][di])
@@ -473,11 +548,12 @@ class LoRATrainer(nn.Module):
             drv_secc_color = torch.cat(drv_secc_colors)
             cano_secc_color = self.ds['cano_secc_color'].repeat([batch_size, 1, 1, 1])
             src_secc_color = self.ds['src_secc_color'].repeat([batch_size, 1, 1, 1])
+            mouth_masks_for_batch = torch.stack(mouth_masks_for_batch).float().cuda()
             cond = {'cond_cano': cano_secc_color,'cond_src': src_secc_color, 'cond_tgt': drv_secc_color,
                     'ref_torso_img': ref_torso_imgs, 'bg_img': bg_img, 
                     'segmap': segmaps_0, # v2v使用第一帧的torso作为source image来warp
-                    'kp_s': kp_src, 'kp_d': kp_drv}
-            if self.inp.get('mouth_encode', False) and self.ds['mouth_ref_img'] is not None:
+                    'kp_s': kp_src, 'kp_d': kp_drv, 'mouth_mask': mouth_masks_for_batch}
+            if self.inp.get('mouth_encode_mode', 'none') != 'none' and self.ds['mouth_ref_img'] is not None:
                 cond['mouth_ref_img'] = self.ds['mouth_ref_img'].unsqueeze(0).repeat([batch_size, 1, 1, 1])
             camera = self.ds['cameras'][drv_idx]
             gen_output = self.secc2video_model.forward(img=None, camera=camera, cond=cond, ret={}, cache_backbone=False, use_cached_backbone=True)
@@ -614,6 +690,7 @@ class LoRATrainer(nn.Module):
             drv_lip_rects = []
             kp_src = []
             kp_drv = []
+            mouth_masks_for_batch = []
             for di in drv_idx:
                 # 读取target image
                 if self.torso_mode:
@@ -641,6 +718,10 @@ class LoRATrainer(nn.Module):
                     segmap = torch.from_numpy(decode_segmap_mask_from_image(seg_img)) # [6, H, W]
                     self.ds['segmaps'][0] = segmap
                 segmaps.append(self.ds['segmaps'][0])
+                
+                # Get the pre-computed mouth mask for the current frame
+                mouth_masks_for_batch.append(self.ds['mouth_masks'][di])
+
                 drv_lip_rects.append(self.ds['lip_rects'][di])
                 kp_src.append(self.ds['kps'][0])
                 kp_drv.append(self.ds['kps'][di])
@@ -650,6 +731,7 @@ class LoRATrainer(nn.Module):
             kp_drv = torch.stack(kp_drv).float().cuda()
             segmaps = torch.stack(segmaps).float().cuda()
             tgt_imgs = torch.stack(gt_imgs).float().cuda()
+            mouth_masks_for_batch = torch.stack(mouth_masks_for_batch).float().cuda()
             for di in drv_idx:
                 _, secc_color = self.secc_renderer(self.ds['id'][0:1], drv_exps[di:di+1], zero_eulers[0:1], zero_trans[0:1])
                 drv_secc_colors.append(secc_color)
@@ -658,8 +740,8 @@ class LoRATrainer(nn.Module):
             src_secc_color = self.ds['src_secc_color'].repeat([batch_size, 1, 1, 1])
             cond = {'cond_cano': cano_secc_color,'cond_src': src_secc_color, 'cond_tgt': drv_secc_color,
                     'ref_torso_img': ref_torso_imgs, 'bg_img': bg_img, 'segmap': segmaps,
-                    'kp_s': kp_src, 'kp_d': kp_drv}
-            if self.inp.get('mouth_encode', False) and self.ds['mouth_ref_img'] is not None:
+                    'kp_s': kp_src, 'kp_d': kp_drv, 'mouth_mask': mouth_masks_for_batch}
+            if self.inp.get('mouth_encode_mode', 'none') != 'none' and self.ds['mouth_ref_img'] is not None:
                 cond['mouth_ref_img'] = self.ds['mouth_ref_img'].unsqueeze(0).repeat([batch_size, 1, 1, 1])
             camera = self.ds['cameras'][drv_idx]
             gen_output = self.secc2video_model.forward(img=None, camera=camera, cond=cond, ret={}, cache_backbone=False, use_cached_backbone=True)
@@ -744,7 +826,7 @@ if __name__ == '__main__':
     parser.add_argument("--torso_ckpt", default='checkpoints/mimictalk_orig/os_secc2plane_torso') # checkpoints/0729_th1kh/secc_img2plane checkpoints/0720_img2planes/secc_img2plane_two_stage
     parser.add_argument("--video_id", default='data/raw/examples/German_20s.mp4', help="identity source, we support (1) already processed <video_id> of GeneFace, (2) video path, (3) image path")
     parser.add_argument("--work_dir", default=None) 
-    parser.add_argument("--max_updates", default=4000, type=int, help="for video, 2000 is good; for an image, 3~10 is good") 
+    parser.add_argument("--max_updates", default=2000, type=int, help="for video, 2000 is good; for an image, 3~10 is good") 
     parser.add_argument("--test", action='store_true') 
     parser.add_argument("--batch_size", default=1, type=int, help="batch size during training, 1 needs 8GB, 2 needs 15GB") 
     parser.add_argument("--lr", default=0.001, type=float) 
@@ -760,7 +842,7 @@ if __name__ == '__main__':
     parser.add_argument("--head_loss_w_mult", default=1.0, type=float, help="multiplier for head losses")
     parser.add_argument("--random_seed", default=None, type=int, help="random seed for reproducibility")
     parser.add_argument("--preprocess_only", action='store_true', help="run preprocessing only and exit")
-    parser.add_argument("--mouth_encode", action='store_true', help="inject mouth features into SR module")
+    parser.add_argument("--mouth_encode_mode", default='none', choices=['none', 'concat', 'add', 'style_latent', 'adain', 'gated', 'film'], help="choose the mouth feature injection mode for the SR module")
 
     args = parser.parse_args()
     
@@ -794,13 +876,19 @@ if __name__ == '__main__':
             'head_loss_w_mult': args.head_loss_w_mult,
             'random_seed': args.random_seed,
             'preprocess_only': args.preprocess_only,
-            'mouth_encode': args.mouth_encode,
+            'mouth_encode_mode': args.mouth_encode_mode,
             }
     if inp['work_dir'] == None:
         video_id = os.path.basename(inp['video_id'])[:-4] if inp['video_id'].endswith((".mp4", ".png", ".jpg", ".jpeg")) else inp['video_id']
         inp['work_dir'] = f'checkpoints_mimictalk/{video_id}'
     os.makedirs(inp['work_dir'], exist_ok=True)
     trainer = LoRATrainer(inp)
+
+    # Initialize the gating network bias if in 'gated' mode
+    if inp['mouth_encode_mode'] == 'gated':
+        # Use the first batch of mouth masks from the dataset for initialization
+        sample_mask = trainer.ds['mouth_masks'][0:1]
+        trainer.secc2video_model.superresolution.initialize_gating_bias(sample_mask)
 
     if inp['preprocess_only']:
         print("| Preprocessing finished. Exiting as --preprocess_only is set.")

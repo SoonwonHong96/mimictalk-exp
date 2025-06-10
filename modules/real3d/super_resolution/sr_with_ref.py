@@ -64,17 +64,132 @@ class SuperresolutionHybrid8XDC_Warp(SuperresolutionHybrid8XDC):
             nn.Conv2d(256, 256, 3, 1, padding=1),
         ])
 
-        if hparams.get('mouth_encode', False):
-            self.mouth_encoder = nn.Sequential(*[
-                nn.Conv2d(3, 64, 3, 2, padding=1), # 256 -> 128
-                nn.LeakyReLU(),
-                nn.Conv2d(64, 128, 3, 2, padding=1), # 128 -> 64
-                nn.LeakyReLU(),
-                nn.Conv2d(128, 256, 3, 2, padding=1), # 64 -> 32
-                nn.LeakyReLU(),
-                nn.Conv2d(256, 256, 3, 1, padding=1),
-            ])
-            self.fuse_mouth_conv = nn.Conv2d(256 + 256, 256, 3, 1, padding=1)
+        self.mouth_encode_mode = hparams.get('mouth_encode_mode', 'none')
+        if self.mouth_encode_mode == 'concat':
+            # Full-resolution encoder for concatenation
+            self.mouth_encoder_concat = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
+            )
+            self.fuse_mouth_conv = nn.Conv2d(256 + 256, 256, kernel_size=3, padding=1)
+        
+        if self.mouth_encode_mode == 'add':
+            # Use a full-resolution encoder, same as 'concat', to avoid interpolation.
+            self.mouth_encoder_add = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
+            )
+
+        if self.mouth_encode_mode == 'style_latent':
+            w_dim = hparams.get('w_dim', 512)
+            self.mouth_encoder_style = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(256, w_dim)
+            )
+            self.style_fusion_layer = nn.Linear(w_dim + w_dim, w_dim)
+
+        if self.mouth_encode_mode == 'adain':
+            num_channels = hparams.get('renderer_out_channels', 256)
+            self.mouth_encoder_adain = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(256, 512) # Intermediate latent
+            )
+            # This layer generates gamma (scale) and beta (bias) for AdaIN
+            self.adain_param_generator = nn.Linear(512, num_channels * 2)
+
+        if self.mouth_encode_mode == 'gated':
+            num_channels = hparams.get('renderer_out_channels', 256)
+            self.mouth_encoder_gated = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(128, num_channels, kernel_size=3, stride=1, padding=1),
+            )
+            self.gating_network = nn.Sequential(
+                nn.Conv2d(num_channels + num_channels, 128, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(128, 1, kernel_size=1, padding=0),
+                nn.Sigmoid()
+            )
+
+        if self.mouth_encode_mode == 'film':
+            num_channels = hparams.get('renderer_out_channels', 256)
+            self.mouth_encoder_film = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(256, 256)
+            )
+            # This layer generates gamma (scale) and beta (shift) for FiLM
+            self.film_generator = nn.Linear(256, num_channels * 2)
+
+    def initialize_gating_bias(self, mouth_mask):
+        """
+        Initializes the bias of the final layer of the gating network.
+        This encourages the network's initial output to resemble the provided mouth mask,
+        giving it a strong prior for where the gate should be active.
+        """
+        if self.mouth_encode_mode != 'gated':
+            print("| Gating bias initialization skipped: mouth_encode_mode is not 'gated'.")
+            return
+
+        print("| Initializing gating network bias...")
+        # We need to find the bias 'b' such that sigmoid(x + b) is close to our mask.
+        # The inverse of sigmoid is the logit function: logit(p) = log(p / (1 - p)).
+        # We can treat the average mask values as the desired initial probabilities.
+        
+        # Ensure mask is on the correct device
+        mouth_mask = mouth_mask.to(self.gating_network[-2].weight.device)
+        
+        # Calculate the mean of the mask for the batch
+        # Add a small epsilon to avoid log(0) for pixels where mask is 0
+        epsilon = 1e-4
+        avg_mask = torch.mean(mouth_mask, dim=0, keepdim=True)
+        avg_mask = torch.clamp(avg_mask, epsilon, 1 - epsilon)
+        
+        # Calculate the logit of the average mask
+        initial_bias = torch.log(avg_mask / (1 - avg_mask))
+
+        # The gating network's final conv layer is at index -2
+        # (because the last element, -1, is the Sigmoid activation)
+        with torch.no_grad():
+            self.gating_network[-2].bias.data.copy_(initial_bias.squeeze(0))
+        
+        print("| Gating network bias initialized successfully.")
 
     def forward(self, rgb, x, ws, ref_torso_rgb, ref_bg_rgb, weights_img, segmap, kp_s, kp_d, target_torso_mask=None, mouth_ref_img=None, **block_kwargs):
         weights_img = weights_img.detach()
@@ -113,7 +228,48 @@ class SuperresolutionHybrid8XDC_Warp(SuperresolutionHybrid8XDC):
                 rgb = rgb * person_occlusion + ref_bg_rgb_256 * (1-person_occlusion) # run6
                 x = torch.cat([x * person_occlusion, x_bg * (1-person_occlusion)], dim=1) # run6
                 x = self.fuse_fg_bg_convs(x)
-                x, rgb = self.block1(x, rgb, ws, **block_kwargs)
+
+                x_for_block1 = x
+                ws_for_block1 = ws
+                if self.mouth_encode_mode != 'none' and mouth_ref_img is not None:
+                    mouth_ref_img_256 = F.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
+                    if self.mouth_encode_mode == 'concat':
+                        mouth_feat = self.mouth_encoder_concat(mouth_ref_img_256)
+                        x_for_block1 = self.fuse_mouth_conv(torch.cat([x, mouth_feat], dim=1))
+                    elif self.mouth_encode_mode == 'add':
+                        mouth_feat = self.mouth_encoder_add(mouth_ref_img_256)
+                        x_for_block1 = x + mouth_feat
+                    elif self.mouth_encode_mode == 'style_latent':
+                        mouth_style_vector = self.mouth_encoder_style(mouth_ref_img_256)
+                        original_style_vector = ws[:, 0, :]
+                        fused_style = self.style_fusion_layer(torch.cat([original_style_vector, mouth_style_vector], dim=-1))
+                        ws_for_block1 = fused_style.unsqueeze(1).expand(-1, 3, -1)
+                    elif self.mouth_encode_mode == 'adain':
+                        # Normalize the content features (x)
+                        normalized_x = F.instance_norm(x)
+                        # Generate AdaIN parameters from mouth reference
+                        mouth_embedding = self.mouth_encoder_adain(mouth_ref_img_256)
+                        adain_params = self.adain_param_generator(mouth_embedding)
+                        gamma, beta = torch.chunk(adain_params, 2, dim=1)
+                        # Reshape for broadcasting
+                        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                        beta = beta.unsqueeze(-1).unsqueeze(-1)
+                        # Apply the new style
+                        x_for_block1 = gamma * normalized_x + beta
+                    elif self.mouth_encode_mode == 'gated':
+                        mouth_feat = self.mouth_encoder_gated(mouth_ref_img_256)
+                        gate_input = torch.cat([x, mouth_feat], dim=1)
+                        alpha_gate = self.gating_network(gate_input)
+                        x_for_block1 = (1 - alpha_gate) * x + alpha_gate * mouth_feat
+                    elif self.mouth_encode_mode == 'film':
+                        mouth_embedding = self.mouth_encoder_film(mouth_ref_img_256)
+                        film_params = self.film_generator(mouth_embedding)
+                        gamma, beta = torch.chunk(film_params, 2, dim=1)
+                        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                        beta = beta.unsqueeze(-1).unsqueeze(-1)
+                        x_for_block1 = (1 + gamma) * x + beta
+
+                x, rgb = self.block1(x_for_block1, rgb, ws_for_block1, **block_kwargs)
 
             elif hparams['htbsr_head_weight_fuse_mode'] == 'v2':
                 # 用alpha-cat实现head torso的x的融合；替代了之前的直接alpha相加
@@ -133,7 +289,48 @@ class SuperresolutionHybrid8XDC_Warp(SuperresolutionHybrid8XDC):
                 rgb = rgb * person_occlusion + ref_bg_rgb_256 * (1-person_occlusion) # run6
                 x = torch.cat([x * person_occlusion, x_bg * (1-person_occlusion)], dim=1) # run6
                 x = self.fuse_fg_bg_convs(x)
-                x, rgb = self.block1(x, rgb, ws, **block_kwargs)
+
+                x_for_block1 = x
+                ws_for_block1 = ws
+                if self.mouth_encode_mode != 'none' and mouth_ref_img is not None:
+                    mouth_ref_img_256 = F.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
+                    if self.mouth_encode_mode == 'concat':
+                        mouth_feat = self.mouth_encoder_concat(mouth_ref_img_256)
+                        x_for_block1 = self.fuse_mouth_conv(torch.cat([x, mouth_feat], dim=1))
+                    elif self.mouth_encode_mode == 'add':
+                        mouth_feat = self.mouth_encoder_add(mouth_ref_img_256)
+                        x_for_block1 = x + mouth_feat
+                    elif self.mouth_encode_mode == 'style_latent':
+                        mouth_style_vector = self.mouth_encoder_style(mouth_ref_img_256)
+                        original_style_vector = ws[:, 0, :]
+                        fused_style = self.style_fusion_layer(torch.cat([original_style_vector, mouth_style_vector], dim=-1))
+                        ws_for_block1 = fused_style.unsqueeze(1).expand(-1, 3, -1)
+                    elif self.mouth_encode_mode == 'adain':
+                        # Normalize the content features (x)
+                        normalized_x = F.instance_norm(x)
+                        # Generate AdaIN parameters from mouth reference
+                        mouth_embedding = self.mouth_encoder_adain(mouth_ref_img_256)
+                        adain_params = self.adain_param_generator(mouth_embedding)
+                        gamma, beta = torch.chunk(adain_params, 2, dim=1)
+                        # Reshape for broadcasting
+                        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                        beta = beta.unsqueeze(-1).unsqueeze(-1)
+                        # Apply the new style
+                        x_for_block1 = gamma * normalized_x + beta
+                    elif self.mouth_encode_mode == 'gated':
+                        mouth_feat = self.mouth_encoder_gated(mouth_ref_img_256)
+                        gate_input = torch.cat([x, mouth_feat], dim=1)
+                        alpha_gate = self.gating_network(gate_input)
+                        x_for_block1 = (1 - alpha_gate) * x + alpha_gate * mouth_feat
+                    elif self.mouth_encode_mode == 'film':
+                        mouth_embedding = self.mouth_encoder_film(mouth_ref_img_256)
+                        film_params = self.film_generator(mouth_embedding)
+                        gamma, beta = torch.chunk(film_params, 2, dim=1)
+                        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                        beta = beta.unsqueeze(-1).unsqueeze(-1)
+                        x_for_block1 = (1 + gamma) * x + beta
+
+                x, rgb = self.block1(x_for_block1, rgb, ws_for_block1, **block_kwargs)
 
             elif hparams['htbsr_head_weight_fuse_mode'] == 'v3':
                 # v2：用alpha-cat实现head torso的x的融合；替代了之前的直接alpha相加
@@ -160,7 +357,48 @@ class SuperresolutionHybrid8XDC_Warp(SuperresolutionHybrid8XDC):
                 # Todo: 修改这里，把cat的occlusion去掉？或者把occlusion截断一下。
                 x = torch.cat([x * person_occlusion, x_bg * (1-person_occlusion)], dim=1) # run6
                 x = self.fuse_fg_bg_convs(x)
-                x, rgb = self.block1(x, rgb, ws, **block_kwargs)
+
+                x_for_block1 = x
+                ws_for_block1 = ws
+                if self.mouth_encode_mode != 'none' and mouth_ref_img is not None:
+                    mouth_ref_img_256 = F.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
+                    if self.mouth_encode_mode == 'concat':
+                        mouth_feat = self.mouth_encoder_concat(mouth_ref_img_256)
+                        x_for_block1 = self.fuse_mouth_conv(torch.cat([x, mouth_feat], dim=1))
+                    elif self.mouth_encode_mode == 'add':
+                        mouth_feat = self.mouth_encoder_add(mouth_ref_img_256)
+                        x_for_block1 = x + mouth_feat
+                    elif self.mouth_encode_mode == 'style_latent':
+                        mouth_style_vector = self.mouth_encoder_style(mouth_ref_img_256)
+                        original_style_vector = ws[:, 0, :]
+                        fused_style = self.style_fusion_layer(torch.cat([original_style_vector, mouth_style_vector], dim=-1))
+                        ws_for_block1 = fused_style.unsqueeze(1).expand(-1, 3, -1)
+                    elif self.mouth_encode_mode == 'adain':
+                        # Normalize the content features (x)
+                        normalized_x = F.instance_norm(x)
+                        # Generate AdaIN parameters from mouth reference
+                        mouth_embedding = self.mouth_encoder_adain(mouth_ref_img_256)
+                        adain_params = self.adain_param_generator(mouth_embedding)
+                        gamma, beta = torch.chunk(adain_params, 2, dim=1)
+                        # Reshape for broadcasting
+                        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                        beta = beta.unsqueeze(-1).unsqueeze(-1)
+                        # Apply the new style
+                        x_for_block1 = gamma * normalized_x + beta
+                    elif self.mouth_encode_mode == 'gated':
+                        mouth_feat = self.mouth_encoder_gated(mouth_ref_img_256)
+                        gate_input = torch.cat([x, mouth_feat], dim=1)
+                        alpha_gate = self.gating_network(gate_input)
+                        x_for_block1 = (1 - alpha_gate) * x + alpha_gate * mouth_feat
+                    elif self.mouth_encode_mode == 'film':
+                        mouth_embedding = self.mouth_encoder_film(mouth_ref_img_256)
+                        film_params = self.film_generator(mouth_embedding)
+                        gamma, beta = torch.chunk(film_params, 2, dim=1)
+                        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                        beta = beta.unsqueeze(-1).unsqueeze(-1)
+                        x_for_block1 = (1 + gamma) * x + beta
+
+                x, rgb = self.block1(x_for_block1, rgb, ws_for_block1, **block_kwargs)
 
             else:
                 # v4 尝试直接用cat处理head-torso的hid的融合，发现不好
@@ -170,16 +408,48 @@ class SuperresolutionHybrid8XDC_Warp(SuperresolutionHybrid8XDC):
         else:
             x = torch.cat([x, x_torso, x_bg], dim=1) # run6
             x = self.fuse_fg_bg_convs(x)
-            x, rgb = self.block1(x, None, ws, **block_kwargs)
-        
-        if hparams.get('mouth_encode', False) and mouth_ref_img is not None:
-            mouth_ref_img_256 = torch.nn.functional.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=self.sr_antialias)
-            mouth_feat = self.mouth_encoder(mouth_ref_img_256)
-            # a bit of a hack, block1's input resolution is 256, but mouth encoder outputs 32x32
-            # we need to upsample it back
-            mouth_feat_256 = torch.nn.functional.interpolate(mouth_feat, size=(256, 256), mode='bilinear', align_corners=False, antialias=self.sr_antialias)
-            x = self.fuse_mouth_conv(torch.cat([x, mouth_feat_256], dim=1))
+            
+            x_for_block1 = x
+            ws_for_block1 = ws
+            if self.mouth_encode_mode != 'none' and mouth_ref_img is not None:
+                mouth_ref_img_256 = F.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
+                if self.mouth_encode_mode == 'concat':
+                    mouth_feat = self.mouth_encoder_concat(mouth_ref_img_256)
+                    x_for_block1 = self.fuse_mouth_conv(torch.cat([x, mouth_feat], dim=1))
+                elif self.mouth_encode_mode == 'add':
+                    mouth_feat = self.mouth_encoder_add(mouth_ref_img_256)
+                    x_for_block1 = x + mouth_feat
+                elif self.mouth_encode_mode == 'style_latent':
+                    mouth_style_vector = self.mouth_encoder_style(mouth_ref_img_256)
+                    original_style_vector = ws[:, 0, :]
+                    fused_style = self.style_fusion_layer(torch.cat([original_style_vector, mouth_style_vector], dim=-1))
+                    ws_for_block1 = fused_style.unsqueeze(1).expand(-1, 3, -1)
+                elif self.mouth_encode_mode == 'adain':
+                    # Normalize the content features (x)
+                    normalized_x = F.instance_norm(x)
+                    # Generate AdaIN parameters from mouth reference
+                    mouth_embedding = self.mouth_encoder_adain(mouth_ref_img_256)
+                    adain_params = self.adain_param_generator(mouth_embedding)
+                    gamma, beta = torch.chunk(adain_params, 2, dim=1)
+                    # Reshape for broadcasting
+                    gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                    beta = beta.unsqueeze(-1).unsqueeze(-1)
+                    # Apply the new style
+                    x_for_block1 = gamma * normalized_x + beta
+                elif self.mouth_encode_mode == 'gated':
+                    mouth_feat = self.mouth_encoder_gated(mouth_ref_img_256)
+                    gate_input = torch.cat([x, mouth_feat], dim=1)
+                    alpha_gate = self.gating_network(gate_input)
+                    x_for_block1 = (1 - alpha_gate) * x + alpha_gate * mouth_feat
+                elif self.mouth_encode_mode == 'film':
+                    mouth_embedding = self.mouth_encoder_film(mouth_ref_img_256)
+                    film_params = self.film_generator(mouth_embedding)
+                    gamma, beta = torch.chunk(film_params, 2, dim=1)
+                    gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                    beta = beta.unsqueeze(-1).unsqueeze(-1)
+                    x_for_block1 = (1 + gamma) * x + beta
 
+                x, rgb = self.block1(x_for_block1, rgb, ws_for_block1, **block_kwargs)
         return rgb, facev2v_ret
    
     @torch.no_grad()
@@ -233,19 +503,95 @@ class SuperresolutionHybrid8XDC_Warp(SuperresolutionHybrid8XDC):
             rgb = rgb * person_occlusion + ref_bg_rgb_256 * (1-person_occlusion) # run6
             x = torch.cat([x * person_occlusion, x_bg * (1-person_occlusion)], dim=1) # run6
             x = self.fuse_fg_bg_convs(x)
-            x, rgb = self.block1(x, rgb, ws, **block_kwargs)
+
+            x_for_block1 = x
+            ws_for_block1 = ws
+            if self.mouth_encode_mode != 'none' and facev2v_ret.get('mouth_ref_img') is not None:
+                mouth_ref_img = facev2v_ret['mouth_ref_img']
+                mouth_ref_img_256 = F.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
+                if self.mouth_encode_mode == 'concat':
+                    mouth_feat = self.mouth_encoder_concat(mouth_ref_img_256)
+                    x_for_block1 = self.fuse_mouth_conv(torch.cat([x, mouth_feat], dim=1))
+                elif self.mouth_encode_mode == 'add':
+                    mouth_feat = self.mouth_encoder_add(mouth_ref_img_256)
+                    x_for_block1 = x + mouth_feat
+                elif self.mouth_encode_mode == 'style_latent':
+                    mouth_style_vector = self.mouth_encoder_style(mouth_ref_img_256)
+                    original_style_vector = ws[:, 0, :]
+                    fused_style = self.style_fusion_layer(torch.cat([original_style_vector, mouth_style_vector], dim=-1))
+                    ws_for_block1 = fused_style.unsqueeze(1).expand(-1, 3, -1)
+                elif self.mouth_encode_mode == 'adain':
+                    # Normalize the content features (x)
+                    normalized_x = F.instance_norm(x)
+                    # Generate AdaIN parameters from mouth reference
+                    mouth_embedding = self.mouth_encoder_adain(mouth_ref_img_256)
+                    adain_params = self.adain_param_generator(mouth_embedding)
+                    gamma, beta = torch.chunk(adain_params, 2, dim=1)
+                    # Reshape for broadcasting
+                    gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                    beta = beta.unsqueeze(-1).unsqueeze(-1)
+                    # Apply the new style
+                    x_for_block1 = gamma * normalized_x + beta
+                elif self.mouth_encode_mode == 'gated':
+                    mouth_feat = self.mouth_encoder_gated(mouth_ref_img_256)
+                    gate_input = torch.cat([x, mouth_feat], dim=1)
+                    alpha_gate = self.gating_network(gate_input)
+                    x_for_block1 = (1 - alpha_gate) * x + alpha_gate * mouth_feat
+                elif self.mouth_encode_mode == 'film':
+                    mouth_embedding = self.mouth_encoder_film(mouth_ref_img_256)
+                    film_params = self.film_generator(mouth_embedding)
+                    gamma, beta = torch.chunk(film_params, 2, dim=1)
+                    gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                    beta = beta.unsqueeze(-1).unsqueeze(-1)
+                    x_for_block1 = (1 + gamma) * x + beta
+
+                x, rgb = self.block1(x_for_block1, rgb, ws_for_block1, **block_kwargs)
         else:
             x = torch.cat([x, x_torso, x_bg], dim=1) # run6
             x = self.fuse_fg_bg_convs(x)
-            x, rgb = self.block1(x, None, ws, **block_kwargs)
+            
+            x_for_block1 = x
+            ws_for_block1 = ws
+            if self.mouth_encode_mode != 'none' and facev2v_ret.get('mouth_ref_img') is not None:
+                mouth_ref_img = facev2v_ret['mouth_ref_img']
+                mouth_ref_img_256 = F.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
+                if self.mouth_encode_mode == 'concat':
+                    mouth_feat = self.mouth_encoder_concat(mouth_ref_img_256)
+                    x_for_block1 = self.fuse_mouth_conv(torch.cat([x, mouth_feat], dim=1))
+                elif self.mouth_encode_mode == 'add':
+                    mouth_feat = self.mouth_encoder_add(mouth_ref_img_256)
+                    x_for_block1 = x + mouth_feat
+                elif self.mouth_encode_mode == 'style_latent':
+                    mouth_style_vector = self.mouth_encoder_style(mouth_ref_img_256)
+                    original_style_vector = ws[:, 0, :]
+                    fused_style = self.style_fusion_layer(torch.cat([original_style_vector, mouth_style_vector], dim=-1))
+                    ws_for_block1 = fused_style.unsqueeze(1).expand(-1, 3, -1)
+                elif self.mouth_encode_mode == 'adain':
+                    # Normalize the content features (x)
+                    normalized_x = F.instance_norm(x)
+                    # Generate AdaIN parameters from mouth reference
+                    mouth_embedding = self.mouth_encoder_adain(mouth_ref_img_256)
+                    adain_params = self.adain_param_generator(mouth_embedding)
+                    gamma, beta = torch.chunk(adain_params, 2, dim=1)
+                    # Reshape for broadcasting
+                    gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                    beta = beta.unsqueeze(-1).unsqueeze(-1)
+                    # Apply the new style
+                    x_for_block1 = gamma * normalized_x + beta
+                elif self.mouth_encode_mode == 'gated':
+                    mouth_feat = self.mouth_encoder_gated(mouth_ref_img_256)
+                    gate_input = torch.cat([x, mouth_feat], dim=1)
+                    alpha_gate = self.gating_network(gate_input)
+                    x_for_block1 = (1 - alpha_gate) * x + alpha_gate * mouth_feat
+                elif self.mouth_encode_mode == 'film':
+                    mouth_embedding = self.mouth_encoder_film(mouth_ref_img_256)
+                    film_params = self.film_generator(mouth_embedding)
+                    gamma, beta = torch.chunk(film_params, 2, dim=1)
+                    gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+                    beta = beta.unsqueeze(-1).unsqueeze(-1)
+                    x_for_block1 = (1 + gamma) * x + beta
 
-        if hparams.get('mouth_encode', False) and facev2v_ret.get('mouth_ref_img') is not None:
-            mouth_ref_img = facev2v_ret['mouth_ref_img']
-            mouth_ref_img_256 = torch.nn.functional.interpolate(mouth_ref_img, size=(256, 256), mode='bilinear', align_corners=False, antialias=self.sr_antialias)
-            mouth_feat = self.mouth_encoder(mouth_ref_img_256)
-            mouth_feat_256 = torch.nn.functional.interpolate(mouth_feat, size=(256, 256), mode='bilinear', align_corners=False, antialias=self.sr_antialias)
-            x = self.fuse_mouth_conv(torch.cat([x, mouth_feat_256], dim=1))
-
+                x, rgb = self.block1(x_for_block1, rgb, ws_for_block1, **block_kwargs)
         return rgb, facev2v_ret
    
 
