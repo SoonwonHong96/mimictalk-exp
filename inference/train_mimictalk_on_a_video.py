@@ -29,7 +29,7 @@ from data_gen.utils.process_video.fit_3dmm_landmark import fit_3dmm_for_a_video
 from data_gen.utils.process_video.extract_segment_imgs import decode_segmap_mask_from_image
 from deep_3drecon.secc_renderer import SECC_Renderer
 from data_gen.eg3d.convert_to_eg3d_convention import get_eg3d_convention_camera_pose_intrinsic
-from data_gen.runs.binarizer_nerf import get_lip_rect, get_eye_rects, create_component_masks_from_landmarks
+from data_gen.runs.binarizer_nerf import get_lip_rect, get_eye_rects, create_component_masks_from_landmarks, get_lip_rect_from_mp
 # Face Parsing 
 from data_gen.utils.mp_feature_extractors.mp_segmenter import MediapipeSegmenter
 from data_gen.utils.process_video.extract_segment_imgs import inpaint_torso_job, extract_background
@@ -175,13 +175,72 @@ class LoRATrainer(nn.Module):
         self.secc_renderer = SECC_Renderer(512)
         self.face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='lm68')
         self.mp_face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='mediapipe')
-        # self.camera_selector = KNearestCameraSelector()
         
         # Initialize discriminators and advanced losses if enabled
         self.init_perceptual_losses(inp)
         self.init_advanced_losses(inp)
 
         self.load_training_data(inp)
+
+    def auto_preprocessing(self, inp):
+        video_id = os.path.basename(inp['video_id'])
+        if video_id.endswith((".mp4", ".png", ".jpg", ".jpeg")):
+            video_id = video_id[:-4]
+
+        raw_video_path = inp['video_id']
+        processed_video_path = f'data/raw/videos/{video_id}.mp4'
+        head_img_pattern = f'data/processed/videos/{video_id}/head_imgs/*.png'
+        coeff_path = f"data/processed/videos/{video_id}/coeff_fit_mp_for_lora.npy"
+        lm2d_path = f'data/processed/videos/{video_id}/lms_2d.npy'
+
+        # Check if all necessary files exist
+        if (os.path.exists(processed_video_path) and 
+            glob.glob(head_img_pattern) and 
+            os.path.exists(coeff_path) and 
+            os.path.exists(lm2d_path)):
+            print("| All necessary processed files found. Skipping preprocessing.")
+            return
+
+        print("| Some processed files are missing. Running automatic preprocessing...")
+        
+        # 1. Crop and rescale video
+        if not os.path.exists(processed_video_path):
+            print("| Step 1/3: Cropping and resizing video...")
+            os.makedirs(os.path.dirname(processed_video_path), exist_ok=True)
+            temp_dir = os.path.join(self.inp['work_dir'], 'temp_preprocessing')
+            os.makedirs(temp_dir, exist_ok=True)
+            cropped_16by9_file = os.path.join(temp_dir, "temp_16x9.mp4")
+            rescaled_video_file = os.path.join(temp_dir, "temp_1360x764.mp4")
+            crop_video_to_16by9(raw_video_path, cropped_16by9_file)
+            rescale_video(cropped_16by9_file, rescaled_video_file, scale_width=1360, scale_height=764)
+            crop_face_area(rescaled_video_file, processed_video_path, crop_size=512, 
+                           offset_x=inp['offset_x'], offset_y=inp['offset_y'])
+            shutil.rmtree(temp_dir)
+            print("| Video preprocessing finished.")
+        
+        # 2. Extract frames, segmentation, and background
+        if not glob.glob(head_img_pattern):
+            print("| Step 2/3: Extracting frames, segmentation maps, and background...")
+            gt_img_dir = f"data/processed/videos/{video_id}/gt_imgs"
+            os.makedirs(gt_img_dir, exist_ok=True)
+            cmd = f"ffmpeg -i {processed_video_path} -vf fps=25,scale=w=512:h=512 -qmin 1 -q:v 1 -start_number 0 -y {gt_img_dir}/%08d.jpg"
+            print(f"| {cmd}")
+            os.system(cmd)
+            cmd = f"python data_gen/utils/process_video/extract_segment_imgs.py --ds_name=nerf --vid_dir={processed_video_path} --force_single_process" 
+            print(f"| {cmd}")
+            os.system(cmd)
+            print("| Frame extraction finished.")
+
+        # 3. Fit 3DMM and get landmarks. This will create both coeff_path and lm2d_path
+        if not os.path.exists(coeff_path) or not os.path.exists(lm2d_path):
+            print("| Step 3/3: Fitting 3DMM coefficients and extracting landmarks...")
+            coeff_dict = fit_3dmm_for_a_video(processed_video_path, save=False)
+            os.makedirs(os.path.dirname(coeff_path), exist_ok=True)
+            np.save(coeff_path, coeff_dict)
+            print("| 3DMM fitting finished.")
+        
+        print("| Automatic preprocessing complete.")
+
     def init_perceptual_losses(self, inp):
         self.criterion_lpips, self.criterion_sd = None, None
         if inp['lambda_lpips'] > 0:
@@ -203,7 +262,9 @@ class LoRATrainer(nn.Module):
             'fsm_lip': inp['lambda_fsm'],
             'gan_eye': inp['lambda_gan'],
             'fsm_eye': inp['lambda_fsm'],
-            'comp_lp': inp['lambda_comp_lp']
+            'comp_lp': inp['lambda_comp_lp'],
+            'comp_lp_eye': inp['lambda_comp_lp'],
+            'comp_lp_lip': inp['lambda_comp_lp'],
         }
 
         # Initialize required models and optimizers based on selected losses
@@ -232,7 +293,7 @@ class LoRATrainer(nn.Module):
         if 'fsm_eye' in self.adv_loss_fns:
             if self.criterion_fsm is None: self.criterion_fsm = FeatureStyleMatchingLoss().cuda()
 
-        if 'comp_lp' in self.adv_loss_fns:
+        if any(k in self.adv_loss_fns for k in ['comp_lp', 'comp_lp_eye', 'comp_lp_lip']):
             self.criterion_comp_lp = FacialComponentPerceptualLoss(loss_weight=1.0).cuda()
 
         # Load checkpoints for initialized models
@@ -296,95 +357,44 @@ class LoRATrainer(nn.Module):
             
         num_params(model)
         self.model = model 
-        return model
+
+        # Automatically run preprocessing if necessary
+        self.auto_preprocessing(inp)
+
+        # Initialize discriminators and advanced losses if enabled
+        self.init_perceptual_losses(inp)
+        self.init_advanced_losses(inp)
+
+        self.load_training_data(inp)
+
     def load_training_data(self, inp):
         video_id = inp['video_id']
         if video_id.endswith((".mp4", ".png", ".jpg", ".jpeg")):
-            # If input video is not GeneFace training videos, convert it into GeneFace convention
-            # using a multi-step preprocessing pipeline.
-            video_id_ = video_id
             video_id = os.path.basename(video_id)[:-4]
             inp['video_id'] = video_id
-            
-            target_video_path = f'data/raw/videos/{video_id}.mp4'
-            if not os.path.exists(target_video_path):
-                print("| Preprocessing video...")
-                os.makedirs(os.path.dirname(target_video_path), exist_ok=True)
-                
-                # Create a temporary directory for intermediate files
-                temp_dir = os.path.join(self.inp['work_dir'], 'temp_preprocessing')
-                os.makedirs(temp_dir, exist_ok=True)
 
-                # Define intermediate file paths
-                cropped_16by9_file = os.path.join(temp_dir, "temp_16x9.mp4")
-                rescaled_video_file = os.path.join(temp_dir, "temp_1360x764.mp4")
+        # All preprocessing is assumed to be done by auto_preprocessing now.
+        # We just need to load the files.
+        coeff_path = f"data/processed/videos/{video_id}/coeff_fit_mp_for_lora.npy"
+        lm2d_path = f'data/processed/videos/{video_id}/lms_2d.npy'
 
-                # Step 1: Crop to 16:9
-                print("| Step 1: Cropping to 16:9...")
-                crop_video_to_16by9(video_id_, cropped_16by9_file)
-
-                # Step 2: Rescale to 1360x764
-                print("| Step 2: Rescaling to 1360x764...")
-                rescale_video(cropped_16by9_file, rescaled_video_file, scale_width=1360, scale_height=764)
-                
-                # Step 3: Crop face area to 512x512
-                # NOTE: Offsets are hardcoded based on common values. 
-                # For better results, these might need to be adjusted per video.
-                print(f"| Step 3: Cropping face area to 512x512 with offset ({inp['offset_x']}, {inp['offset_y']})...")
-                crop_face_area(rescaled_video_file, target_video_path, crop_size=512, 
-                               offset_x=inp['offset_x'], offset_y=inp['offset_y'])
-                
-                # Clean up temporary directory
-                shutil.rmtree(temp_dir)
-                print("| Preprocessing finished.")
-
-        target_video_path = f'data/raw/videos/{video_id}.mp4'
-        print(f"| Copy source video into work dir: {self.inp['work_dir']}")
-        os.system(f"cp {target_video_path} {self.inp['work_dir']}")
-        # check head_img path
-        head_img_pattern = f'data/processed/videos/{video_id}/head_imgs/*.png'
-        head_img_names = sorted(glob.glob(head_img_pattern))
-        if len(head_img_names) == 0:
-            # extract head_imgs
-            head_img_dir = os.path.dirname(head_img_pattern)
-            print(f"| Pre-extracted head_imgs not found, try to extract and save to {head_img_dir}, this may take a while...")
-            gt_img_dir = f"data/processed/videos/{video_id}/gt_imgs"
-            os.makedirs(gt_img_dir, exist_ok=True)
-            target_video_path = f'data/raw/videos/{video_id}.mp4'
-            cmd = f"ffmpeg -i {target_video_path} -vf fps=25,scale=w=512:h=512 -qmin 1 -q:v 1 -start_number 0 -y {gt_img_dir}/%08d.jpg"
-            print(f"| {cmd}")
-            os.system(cmd)
-            # extract image, segmap, and background
-            cmd = f"python data_gen/utils/process_video/extract_segment_imgs.py --ds_name=nerf --vid_dir={target_video_path} --force_single_process" 
-            print(f"| {cmd}")
-            os.system(cmd)
-            print("| Head images Extracted!")
-        num_samples = len(head_img_names)
-        npy_name = f"data/processed/videos/{video_id}/coeff_fit_mp_for_lora.npy"
-        if os.path.exists(npy_name):
-            coeff_dict = np.load(npy_name, allow_pickle=True).tolist()
-        else:
-            print(f"| Pre-extracted 3DMM coefficient not found, try to extract and save to {npy_name}, this may take a while...")
-            coeff_dict = fit_3dmm_for_a_video(f'data/raw/videos/{video_id}.mp4', save=False)
-            os.makedirs(os.path.dirname(npy_name), exist_ok=True)
-            np.save(npy_name, coeff_dict)
+        coeff_dict = np.load(coeff_path, allow_pickle=True).tolist()
+        mp_lm2ds = np.load(lm2d_path)
+        
         ids = convert_to_tensor(coeff_dict['id']).reshape([-1,80]).cuda()
         exps = convert_to_tensor(coeff_dict['exp']).reshape([-1,64]).cuda()
         eulers = convert_to_tensor(coeff_dict['euler']).reshape([-1,3]).cuda()
         trans = convert_to_tensor(coeff_dict['trans']).reshape([-1,3]).cuda()
-        WH = 512 # now we only support 512x512
-        
-        # Get mediapipe landmarks for mask generation
-        # Note: The original 3dmm fitting process uses its own landmark reconstruction.
-        # For high-quality masks, we re-calculate lm2ds directly from the 3dmm coefficients.
-        mp_lm2ds = self.mp_face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cpu().numpy()
-        mp_lm2ds = mp_lm2ds * WH 
-        
+        WH = 512
+
+        if mp_lm2ds.shape[1] > 468: # Use the first 468 for consistency if 478 are present
+            mp_lm2ds = mp_lm2ds[:, :468, :]
+
         mouth_ref_img = None
         if self.inp.get('mouth_encode_mode', 'none') != 'none':
-            # Using 68 landmarks, upper inner lip is 62, lower inner lip is 66.
-            # We use the y-coordinate to measure vertical distance.
-            lip_dists = mp_lm2ds[:, 66, 1] - mp_lm2ds[:, 62, 1]
+            # We need to use the 68-landmark subset for these specific indices
+            lm68_for_lip_dist = self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cpu().numpy() * WH
+            lip_dists = lm68_for_lip_dist[:, 66, 1] - lm68_for_lip_dist[:, 62, 1]
             mouth_open_idx = np.argmax(lip_dists)
             print(f"| Found most open mouth frame at index: {mouth_open_idx}")
 
@@ -397,7 +407,7 @@ class LoRATrainer(nn.Module):
                 full_ref_img_bgr = cv2.imread(mouth_ref_img_name)
                 
                 # Get the y-coordinate of the nose tip (landmark 33) and crop below it.
-                nose_tip_y = mp_lm2ds[mouth_open_idx, 33, 1]
+                nose_tip_y = lm68_for_lip_dist[mouth_open_idx, 33, 1]
                 crop_y_start = int(nose_tip_y)
                 
                 # Ensure crop start is within image bounds
@@ -418,7 +428,7 @@ class LoRATrainer(nn.Module):
             else:
                 print(f"| WARNING: Could not find mouth reference image: {mouth_ref_img_name}")
 
-        lip_rects = [get_lip_rect(mp_lm2ds[i], WH, WH) for i in range(len(mp_lm2ds))]
+        lip_rects = [get_lip_rect_from_mp(mp_lm2ds[i], WH, WH) for i in range(len(mp_lm2ds))]
         kps = self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cuda()
         kps = (kps-0.5) / 0.5 # rescale to -1~1
         kps = torch.cat([kps, torch.zeros([*kps.shape[:-1], 1]).cuda()], dim=-1)
@@ -437,11 +447,15 @@ class LoRATrainer(nn.Module):
         _, cano_secc_color = self.secc_renderer(ids[0:1], exps[0:1]*0, zero_eulers[0:1], zero_trans[0:1])
         src_idx = 0
         _, src_secc_color = self.secc_renderer(ids[0:1], exps[src_idx:src_idx+1], zero_eulers[0:1], zero_trans[0:1])
-        drv_secc_colors = [None for _ in range(len(exps))]
-        drv_head_imgs = [None for _ in range(len(exps))]
-        drv_torso_imgs = [None for _ in range(len(exps))]
-        drv_com_imgs = [None for _ in range(len(exps))]
-        segmaps = [None for _ in range(len(exps))]
+        
+        # Initialize lazy-loading placeholders
+        num_samples = len(cameras)
+        drv_secc_colors = [None for _ in range(num_samples)]
+        drv_head_imgs = [None for _ in range(num_samples)]
+        drv_torso_imgs = [None for _ in range(num_samples)]
+        drv_com_imgs = [None for _ in range(num_samples)]
+        segmaps = [None for _ in range(num_samples)]
+
         img_name = f'data/processed/videos/{video_id}/bg.jpg'
         bg_img = torch.tensor(cv2.imread(img_name)[..., ::-1] / 127.5 - 1).permute(2,0,1).float() # [3, H, W]
         ds = {
@@ -466,7 +480,8 @@ class LoRATrainer(nn.Module):
         }
         self.ds = ds
         # Add eye rects for facial component loss
-        self.ds['eye_rects'] = [get_eye_rects(mp_lm2ds[i], WH, WH) for i in range(len(mp_lm2ds))]
+        lm68_for_rects = self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cpu().numpy() * WH
+        self.ds['eye_rects'] = [get_eye_rects(lm68_for_rects[i], WH, WH) for i in range(len(lm68_for_rects))]
         return ds
     
     def training_loop(self, inp):
@@ -700,9 +715,13 @@ class LoRATrainer(nn.Module):
                 # eye_mask[i, 0, r_ymin:r_ymax, r_xmin:r_xmax] = 1
 
             if self.use_adv_loss:
-                # Use the pre-computed tight eye mask
                 if 'comp_lp' in self.adv_loss_fns:
-                    losses['comp_lp'] = self.criterion_comp_lp(pred_imgs, tgt_imgs, eye_masks_for_batch)
+                    component_mask = (eye_masks_for_batch + mouth_masks_for_batch).clamp(0, 1)
+                    losses['comp_lp'] = self.criterion_comp_lp(pred_imgs, tgt_imgs, component_mask)
+                if 'comp_lp_eye' in self.adv_loss_fns:
+                    losses['comp_lp_eye'] = self.criterion_comp_lp(pred_imgs, tgt_imgs, eye_masks_for_batch)
+                if 'comp_lp_lip' in self.adv_loss_fns:
+                    losses['comp_lp_lip'] = self.criterion_comp_lp(pred_imgs, tgt_imgs, mouth_masks_for_batch)
 
             losses['mse_loss'] = mse_loss
             losses['head_mse_loss'] = head_mse_loss
@@ -1119,10 +1138,10 @@ if __name__ == '__main__':
     parser.add_argument("--a2m_ckpt", default='', help="checkpoint directory of audio2secc model, if provided test_loop will run unseen audio validation")
     parser.add_argument("--val_audio", default='', help="path to an unseen audio file for additional validation during training")
     # Advanced Loss arguments - New flexible system
-    parser.add_argument("--adv_loss_fns", default="", type=str, help="Space-separated list of advanced loss functions to use (e.g., 'gan gan_lip fsm_lip gan_eye fsm_eye comp_lp').")
+    parser.add_argument("--adv_loss_fns", default="", type=str, help="Space-separated list of advanced loss functions to use (e.g., 'gan gan_lip fsm_lip comp_lp comp_lp_eye comp_lp_lip').")
     parser.add_argument("--lambda_gan", default=1.0, type=float, help="Generic weight for all GAN losses.")
     parser.add_argument("--lambda_fsm", default=10.0, type=float, help="Generic weight for all Feature Style Matching losses.")
-    parser.add_argument("--lambda_comp_lp", default=1.0, type=float, help="Weight for Facial Component Perceptual loss.")
+    parser.add_argument("--lambda_comp_lp", default=1.0, type=float, help="Generic weight for all Facial Component Perceptual losses (comp_lp, comp_lp_eye, comp_lp_lip).")
     parser.add_argument("--lr_d", default=0.0001, type=float, help="learning rate for discriminators")
     parser.add_argument("--lambda_lpips", default=0.5, type=float, help="Weight for LPIPS (VGG) perceptual loss. Set to 0 to disable.")
     parser.add_argument("--lambda_sd", default=0.0, type=float, help="Weight for Stable Diffusion perceptual loss. Set to 0 to disable.")
@@ -1176,6 +1195,8 @@ if __name__ == '__main__':
         video_id = os.path.basename(inp['video_id'])[:-4] if inp['video_id'].endswith((".mp4", ".png", ".jpg", ".jpeg")) else inp['video_id']
         
         # Create a descriptive suffix based on enabled losses for automatic work_dir naming
+        lora_suffix = f"_lora_{inp['lora_mode']}_rank_{inp['lora_r']}"
+
         loss_suffix_parts = []
         if inp['adv_loss_fns']:
             loss_suffix_parts.extend(sorted(inp['adv_loss_fns'].split()))
@@ -1184,7 +1205,7 @@ if __name__ == '__main__':
         
         loss_suffix = ('_' + '_'.join(loss_suffix_parts)) if loss_suffix_parts else ''
         
-        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{loss_suffix}'
+        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{lora_suffix}{loss_suffix}'
     os.makedirs(inp['work_dir'], exist_ok=True)
     trainer = LoRATrainer(inp)
 

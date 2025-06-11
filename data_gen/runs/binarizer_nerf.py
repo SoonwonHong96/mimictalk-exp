@@ -132,28 +132,32 @@ def get_lip_rect(lms, h, w):
     rect = [rect_x, rect_x + rect_w, rect_y, rect_y + rect_h] # min_j,  max_j, min_i, max_i
     return rect # this x is width, y is height
 
+def get_lip_rect_from_mp(lms, h, w):
+    """
+    lms: [478, 2] landmarks from mediapipe
+    h, w: int
+    return: [4,]
+    """
+    assert len(lms) == 478
+    # Outer lip indices from mediapipe face mesh
+    lips = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
+    lms_lips = lms[lips, :]
+    min_x, max_x = np.min(lms_lips[:, 0]), np.max(lms_lips[:, 0])
+    min_y, max_y = np.min(lms_lips[:, 1]), np.max(lms_lips[:, 1])
+    
+    # Padding
+    pad_x = (max_x - min_x) * 0.2
+    pad_y = (max_y - min_y) * 0.2
+    min_x, max_x = int(min_x - pad_x), int(max_x + pad_x)
+    min_y, max_y = int(min_y - pad_y), int(max_y + pad_y)
 
-# def get_lip_rect(lms, h, w):
-#     """
-#     lms: [68, 2]
-#     h, w: int
-#     return: [4,]
-#     """
-#     assert len(lms) == 68
-#     lips = slice(48, 60)
-#     # this x is width, y is height
-#     xmin, xmax = int(lms[lips, 1].min()), int(lms[lips, 1].max())
-#     ymin, ymax = int(lms[lips, 0].min()), int(lms[lips, 0].max())
-#     # padding to H == W
-#     cx = (xmin + xmax) // 2
-#     cy = (ymin + ymax) // 2
-#     l = max(xmax - xmin, ymax - ymin) // 2
-#     xmin = max(0, cx - l)
-#     xmax = min(h, cx + l)
-#     ymin = max(0, cy - l)
-#     ymax = min(w, cy + l)
-#     lip_rect = [xmin, xmax, ymin, ymax]
-#     return lip_rect
+    # Ensure rect is within image bounds
+    min_x = max(0, min_x)
+    max_x = min(w - 1, max_x)
+    min_y = max(0, min_y)
+    max_y = min(h - 1, max_y)
+
+    return [min_x, max_x, min_y, max_y]
 
 def get_win_conds(conds, idx, smo_win_size=8, pad_option='zero'):
     """
