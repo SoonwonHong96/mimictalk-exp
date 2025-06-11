@@ -45,6 +45,7 @@ meter = AvgrageMeter()
 from torch.utils.tensorboard import SummaryWriter
 # New imports for advanced losses
 from modules.losses.gan_loss import MultiScaleDiscriminator, PerceptualLoss, FacialComponentPerceptualLoss, FeatureStyleMatchingLoss, GANLoss
+from modules.losses.sd_loss import SDPerceptualLoss
 
 def crop_video_to_16by9(input_file: str, output_file: str):
     """
@@ -177,38 +178,73 @@ class LoRATrainer(nn.Module):
         # self.camera_selector = KNearestCameraSelector()
         
         # Initialize discriminators and advanced losses if enabled
+        self.init_perceptual_losses(inp)
         self.init_advanced_losses(inp)
 
         self.load_training_data(inp)
+    def init_perceptual_losses(self, inp):
+        self.criterion_lpips, self.criterion_sd = None, None
+        if inp['lambda_lpips'] > 0:
+            self.criterion_lpips = lpips.LPIPS(net='alex',lpips=True).cuda()
+            print(f"| LPIPS (VGG) perceptual loss enabled with weight: {inp['lambda_lpips']}")
+        if inp['lambda_sd'] > 0:
+            self.criterion_sd = SDPerceptualLoss(loss_weight=1.0).cuda()
+            print(f"| Stable Diffusion perceptual loss enabled with weight: {inp['lambda_sd']}")
+
     def init_advanced_losses(self, inp):
-        self.use_adv_loss = inp['lambda_gan'] > 0
+        self.adv_loss_fns = inp['adv_loss_fns'].split()
+        self.use_adv_loss = len(self.adv_loss_fns) > 0
         if not self.use_adv_loss:
             return
 
-        # Initialize Discriminators
-        self.D_full = MultiScaleDiscriminator(num_D=2).cuda()
-        self.D_lip = MultiScaleDiscriminator(num_D=2).cuda()
-        self.D_eye = MultiScaleDiscriminator(num_D=2).cuda()
-        
-        # Initialize GAN losses
-        self.criterion_gan = GANLoss(gan_mode='hinge').cuda()
-        self.criterion_fsm = FeatureStyleMatchingLoss().cuda()
-        self.criterion_comp_lp = FacialComponentPerceptualLoss(loss_weight=inp['lambda_comp_lp']).cuda()
-        
-        # Initialize Optimizers for Discriminators
-        self.optimizer_D_full = torch.optim.Adam(self.D_full.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
-        self.optimizer_D_lip = torch.optim.Adam(self.D_lip.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
-        self.optimizer_D_eye = torch.optim.Adam(self.D_eye.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
+        self.adv_loss_weights = {
+            'gan': inp['lambda_gan'],
+            'gan_lip': inp['lambda_gan'],
+            'fsm_lip': inp['lambda_fsm'],
+            'gan_eye': inp['lambda_gan'],
+            'fsm_eye': inp['lambda_fsm'],
+            'comp_lp': inp['lambda_comp_lp']
+        }
 
+        # Initialize required models and optimizers based on selected losses
+        self.D_full, self.D_lip, self.D_eye = None, None, None
+        self.optimizer_D_full, self.optimizer_D_lip, self.optimizer_D_eye = None, None, None
+        self.criterion_gan, self.criterion_fsm, self.criterion_comp_lp = None, None, None
+
+        if 'gan' in self.adv_loss_fns:
+            self.D_full = MultiScaleDiscriminator(num_D=2).cuda()
+            self.optimizer_D_full = torch.optim.Adam(self.D_full.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
+            self.criterion_gan = GANLoss(gan_mode='hinge').cuda()
+
+        if 'gan_lip' in self.adv_loss_fns or 'fsm_lip' in self.adv_loss_fns:
+            self.D_lip = MultiScaleDiscriminator(num_D=2).cuda()
+            self.optimizer_D_lip = torch.optim.Adam(self.D_lip.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
+            if self.criterion_gan is None: self.criterion_gan = GANLoss(gan_mode='hinge').cuda()
+        
+        if 'fsm_lip' in self.adv_loss_fns:
+             self.criterion_fsm = FeatureStyleMatchingLoss().cuda()
+
+        if 'gan_eye' in self.adv_loss_fns or 'fsm_eye' in self.adv_loss_fns:
+            self.D_eye = MultiScaleDiscriminator(num_D=2).cuda()
+            self.optimizer_D_eye = torch.optim.Adam(self.D_eye.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
+            if self.criterion_gan is None: self.criterion_gan = GANLoss(gan_mode='hinge').cuda()
+
+        if 'fsm_eye' in self.adv_loss_fns:
+            if self.criterion_fsm is None: self.criterion_fsm = FeatureStyleMatchingLoss().cuda()
+
+        if 'comp_lp' in self.adv_loss_fns:
+            self.criterion_comp_lp = FacialComponentPerceptualLoss(loss_weight=1.0).cuda()
+
+        # Load checkpoints for initialized models
         lora_ckpt_path = os.path.join(inp['work_dir'], 'checkpoint.ckpt')
         if os.path.exists(lora_ckpt_path):
-             print("| Loading discriminators from checkpoint...")
-             load_ckpt(self.D_full, lora_ckpt_path, model_name='D_full', strict=False)
-             load_ckpt(self.D_lip, lora_ckpt_path, model_name='D_lip', strict=False)
-             load_ckpt(self.D_eye, lora_ckpt_path, model_name='D_eye', strict=False)
-             load_ckpt(self.optimizer_D_full, lora_ckpt_path, model_name='optimizer_D_full', strict=False)
-             load_ckpt(self.optimizer_D_lip, lora_ckpt_path, model_name='optimizer_D_lip', strict=False)
-             load_ckpt(self.optimizer_D_eye, lora_ckpt_path, model_name='optimizer_D_eye', strict=False)
+             print("| Loading advanced loss models from checkpoint...")
+             if self.D_full: load_ckpt(self.D_full, lora_ckpt_path, model_name='D_full', strict=False)
+             if self.D_lip: load_ckpt(self.D_lip, lora_ckpt_path, model_name='D_lip', strict=False)
+             if self.D_eye: load_ckpt(self.D_eye, lora_ckpt_path, model_name='D_eye', strict=False)
+             if self.optimizer_D_full: load_ckpt(self.optimizer_D_full, lora_ckpt_path, model_name='optimizer_D_full', strict=False)
+             if self.optimizer_D_lip: load_ckpt(self.optimizer_D_lip, lora_ckpt_path, model_name='optimizer_D_lip', strict=False)
+             if self.optimizer_D_eye: load_ckpt(self.optimizer_D_eye, lora_ckpt_path, model_name='optimizer_D_eye', strict=False)
 
     def load_secc2video(self, model_dir):
         inp = self.inp
@@ -442,7 +478,11 @@ class LoRATrainer(nn.Module):
         num_main_params = sum(p.numel() for p in main_model_trainable_params)
         print(f"| Found {num_main_params} trainable parameters in the main model.")
 
-        self.criterion_lpips = lpips.LPIPS(net='alex',lpips=True).cuda()
+        if inp['perceptual_loss_mode'] == 'sd':
+            self.criterion_lpips = SDPerceptualLoss(loss_weight=1.0).cuda()
+        else: # vgg
+            self.criterion_lpips = lpips.LPIPS(net='alex',lpips=True).cuda()
+        
         self.logger = SummaryWriter(log_dir=inp['work_dir'])
         if not hasattr(self, 'learnable_triplane'):
             src_idx = 0 # init triplane from the first frame's prediction
@@ -488,22 +528,25 @@ class LoRATrainer(nn.Module):
             'mse_loss': 1.,
             'head_mse_loss': 0.2 * inp['head_loss_w_mult'],
             'lip_mse_loss': 1.0 * inp['lip_loss_w_mult'],
-            'lpips_loss': 0.5,
-            'head_lpips_loss': 0.1 * inp['head_loss_w_mult'],
-            'lip_lpips_loss': 1.0 * inp['lip_loss_w_mult'],
             'blink_reg_loss': inp['blink_reg_loss_w'],
             'triplane_reg_loss': lambda_reg_triplane,
             'secc_reg_loss': inp['secc_reg_loss_w'],
         }
 
+        # Add perceptual loss weights if used
+        if self.criterion_lpips:
+            loss_weights['lpips_loss'] = inp['lambda_lpips']
+            loss_weights['head_lpips_loss'] = 0.1 * inp['lambda_lpips']
+            loss_weights['lip_lpips_loss'] = 1.0 * inp['lambda_lpips']
+        
+        if self.criterion_sd:
+            loss_weights['sd_loss'] = inp['lambda_sd']
+            loss_weights['head_sd_loss'] = 0.1 * inp['lambda_sd']
+            loss_weights['lip_sd_loss'] = 1.0 * inp['lambda_sd']
+
         # Add advanced loss weights if used
-        if self.use_adv_loss:
-            loss_weights['gan_loss'] = inp['lambda_gan']
-            loss_weights['gan_loss_lip'] = inp['lambda_gan']
-            loss_weights['fsm_loss_lip'] = inp['lambda_fsm']
-            loss_weights['gan_loss_eye'] = inp['lambda_gan']
-            loss_weights['fsm_loss_eye'] = inp['lambda_fsm']
-            loss_weights['comp_lpips_loss'] = inp['lambda_comp_lp']
+        for loss_name in self.adv_loss_fns:
+            loss_weights[loss_name] = self.adv_loss_weights[loss_name]
 
         for i_step in tqdm.trange(num_updates+1,desc="training lora..."):
             milestone_steps = []
@@ -621,12 +664,19 @@ class LoRATrainer(nn.Module):
 
             mse_loss = (pred_imgs - tgt_imgs).abs().mean()
             head_mse_loss = (pred_imgs_raw - F.interpolate(head_imgs, size=(neural_rendering_reso,neural_rendering_reso), mode='bilinear', antialias=True)).abs().mean()
-            lpips_loss = self.criterion_lpips(pred_imgs, tgt_imgs).mean()
-            head_lpips_loss = self.criterion_lpips(pred_imgs_raw, F.interpolate(head_imgs, size=(neural_rendering_reso,neural_rendering_reso), mode='bilinear', antialias=True)).mean()
             
+            if self.criterion_lpips:
+                losses['lpips_loss'] = self.criterion_lpips(pred_imgs, tgt_imgs).mean()
+                losses['head_lpips_loss'] = self.criterion_lpips(pred_imgs_raw, F.interpolate(head_imgs, size=(neural_rendering_reso,neural_rendering_reso), mode='bilinear', antialias=True)).mean()
+            
+            if self.criterion_sd:
+                losses['sd_loss'] = self.criterion_sd(pred_imgs, tgt_imgs)
+                losses['head_sd_loss'] = self.criterion_sd(pred_imgs_raw, F.interpolate(head_imgs, size=(neural_rendering_reso,neural_rendering_reso), mode='bilinear', antialias=True))
+
             # Prepare for component losses
             lip_mse_loss = 0
             lip_lpips_loss = 0
+            lip_sd_loss = 0
             comp_lpips_loss = 0
 
             # Create masks for facial component loss
@@ -638,7 +688,10 @@ class LoRATrainer(nn.Module):
                 lip_pred_imgs = pred_imgs[i:i+1,:, ymin:ymax,xmin:xmax].contiguous()
                 try:
                     lip_mse_loss += (lip_pred_imgs - lip_tgt_imgs).abs().mean()
-                    lip_lpips_loss += self.criterion_lpips(lip_pred_imgs, lip_tgt_imgs).mean()
+                    if self.criterion_lpips:
+                        lip_lpips_loss += self.criterion_lpips(lip_pred_imgs, lip_tgt_imgs).mean()
+                    if self.criterion_sd:
+                        lip_sd_loss += self.criterion_sd(lip_pred_imgs, lip_tgt_imgs)
                 except: pass
 
                 # Eye mask for component loss - This part is now simplified
@@ -648,15 +701,19 @@ class LoRATrainer(nn.Module):
 
             if self.use_adv_loss:
                 # Use the pre-computed tight eye mask
-                comp_lpips_loss = self.criterion_comp_lp(pred_imgs, tgt_imgs, eye_masks_for_batch)
-                losses['comp_lpips_loss'] = comp_lpips_loss
+                if 'comp_lp' in self.adv_loss_fns:
+                    losses['comp_lp'] = self.criterion_comp_lp(pred_imgs, tgt_imgs, eye_masks_for_batch)
 
             losses['mse_loss'] = mse_loss
             losses['head_mse_loss'] = head_mse_loss
-            losses['lpips_loss'] = lpips_loss
-            losses['head_lpips_loss'] = head_lpips_loss
+            
+            if self.criterion_lpips:
+                losses['lip_lpips_loss'] = lip_lpips_loss / batch_size
+            
+            if self.criterion_sd:
+                losses['lip_sd_loss'] = lip_sd_loss / batch_size
+            
             losses['lip_mse_loss'] = lip_mse_loss / batch_size
-            losses['lip_lpips_loss'] = lip_lpips_loss / batch_size
 
             # eye blink reg loss
             if i_step % 4 == 0:
@@ -714,31 +771,34 @@ class LoRATrainer(nn.Module):
             if self.use_adv_loss:
                 # Generator loss
                 # 1. Full image GAN loss
-                losses['gan_loss'] = self.criterion_gan(self.D_full(pred_imgs), target_is_real=True)
+                if 'gan' in self.adv_loss_fns:
+                    losses['gan'] = self.criterion_gan(self.D_full(pred_imgs), target_is_real=True)
 
                 # 2. Lip region GAN and FSM loss
-                # Use the first lip rect for simplicity in batch
-                xmin, xmax, ymin, ymax = drv_lip_rects[0]
-                pred_lip_region = pred_imgs[:, :, ymin:ymax, xmin:xmax]
-                gt_lip_region = tgt_imgs[:, :, ymin:ymax, xmin:xmax]
-
-                losses['gan_loss_lip'] = self.criterion_gan(self.D_lip(pred_lip_region), target_is_real=True)
-                
-                pred_lip_feats = self.D_lip.get_features(pred_lip_region)
-                gt_lip_feats = self.D_lip.get_features(gt_lip_region.detach())
-                losses['fsm_loss_lip'] = self.criterion_fsm(pred_lip_feats, gt_lip_feats)
+                if 'gan_lip' in self.adv_loss_fns or 'fsm_lip' in self.adv_loss_fns:
+                    xmin, xmax, ymin, ymax = drv_lip_rects[0]
+                    pred_lip_region = pred_imgs[:, :, ymin:ymax, xmin:xmax]
+                    gt_lip_region = tgt_imgs[:, :, ymin:ymax, xmin:xmax]
+                    
+                    if 'gan_lip' in self.adv_loss_fns:
+                        losses['gan_lip'] = self.criterion_gan(self.D_lip(pred_lip_region), target_is_real=True)
+                    if 'fsm_lip' in self.adv_loss_fns:
+                        pred_lip_feats = self.D_lip.get_features(pred_lip_region)
+                        gt_lip_feats = self.D_lip.get_features(gt_lip_region.detach())
+                        losses['fsm_lip'] = self.criterion_fsm(pred_lip_feats, gt_lip_feats)
 
                 # 3. Eye region GAN and FSM loss
-                (l_xmin, l_xmax, l_ymin, l_ymax), (r_xmin, r_xmax, r_ymin, r_ymax) = drv_eye_rects[0]
-                # For simplicity, we'll just use the left eye for the component discriminator
-                pred_eye_region = pred_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax]
-                gt_eye_region = tgt_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax]
-                
-                losses['gan_loss_eye'] = self.criterion_gan(self.D_eye(pred_eye_region), target_is_real=True)
-
-                pred_eye_feats = self.D_eye.get_features(pred_eye_region)
-                gt_eye_feats = self.D_eye.get_features(gt_eye_region.detach())
-                losses['fsm_loss_eye'] = self.criterion_fsm(pred_eye_feats, gt_eye_feats)
+                if 'gan_eye' in self.adv_loss_fns or 'fsm_eye' in self.adv_loss_fns:
+                    (l_xmin, l_xmax, l_ymin, l_ymax), (r_xmin, r_xmax, r_ymin, r_ymax) = drv_eye_rects[0]
+                    pred_eye_region = pred_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax]
+                    gt_eye_region = tgt_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax]
+                    
+                    if 'gan_eye' in self.adv_loss_fns:
+                        losses['gan_eye'] = self.criterion_gan(self.D_eye(pred_eye_region), target_is_real=True)
+                    if 'fsm_eye' in self.adv_loss_fns:
+                        pred_eye_feats = self.D_eye.get_features(pred_eye_region)
+                        gt_eye_feats = self.D_eye.get_features(gt_eye_region.detach())
+                        losses['fsm_eye'] = self.criterion_fsm(pred_eye_feats, gt_eye_feats)
 
             total_loss = sum([loss_weights.get(k, 1.0) * v for k, v in losses.items() if isinstance(v, torch.Tensor) and v.requires_grad])
             
@@ -752,28 +812,39 @@ class LoRATrainer(nn.Module):
             # Update Discriminators
             if self.use_adv_loss:
                 # Full Image Discriminator
-                self.optimizer_D_full.zero_grad()
-                loss_d_full_real = self.criterion_gan(self.D_full(tgt_imgs.detach()), target_is_real=True)
-                loss_d_full_fake = self.criterion_gan(self.D_full(pred_imgs.detach()), target_is_real=False)
-                loss_d_full = (loss_d_full_real + loss_d_full_fake) * 0.5
-                loss_d_full.backward()
-                self.optimizer_D_full.step()
+                if self.D_full:
+                    self.optimizer_D_full.zero_grad()
+                    loss_d_full_real = self.criterion_gan(self.D_full(tgt_imgs.detach()), target_is_real=True)
+                    loss_d_full_fake = self.criterion_gan(self.D_full(pred_imgs.detach()), target_is_real=False)
+                    loss_d_full = (loss_d_full_real + loss_d_full_fake) * 0.5
+                    loss_d_full.backward()
+                    self.optimizer_D_full.step()
                 
                 # Lip Discriminator
-                self.optimizer_D_lip.zero_grad()
-                loss_d_lip_real = self.criterion_gan(self.D_lip(gt_lip_region.detach()), target_is_real=True)
-                loss_d_lip_fake = self.criterion_gan(self.D_lip(pred_lip_region.detach()), target_is_real=False)
-                loss_d_lip = (loss_d_lip_real + loss_d_lip_fake) * 0.5
-                loss_d_lip.backward()
-                self.optimizer_D_lip.step()
+                if self.D_lip:
+                    self.optimizer_D_lip.zero_grad()
+                    # Re-slice lip region for discriminator update
+                    xmin, xmax, ymin, ymax = drv_lip_rects[0]
+                    pred_lip_region = pred_imgs[:, :, ymin:ymax, xmin:xmax].detach()
+                    gt_lip_region = tgt_imgs[:, :, ymin:ymax, xmin:xmax].detach()
+                    loss_d_lip_real = self.criterion_gan(self.D_lip(gt_lip_region), target_is_real=True)
+                    loss_d_lip_fake = self.criterion_gan(self.D_lip(pred_lip_region), target_is_real=False)
+                    loss_d_lip = (loss_d_lip_real + loss_d_lip_fake) * 0.5
+                    loss_d_lip.backward()
+                    self.optimizer_D_lip.step()
 
                 # Eye Discriminator
-                self.optimizer_D_eye.zero_grad()
-                loss_d_eye_real = self.criterion_gan(self.D_eye(gt_eye_region.detach()), target_is_real=True)
-                loss_d_eye_fake = self.criterion_gan(self.D_eye(pred_eye_region.detach()), target_is_real=False)
-                loss_d_eye = (loss_d_eye_real + loss_d_eye_fake) * 0.5
-                loss_d_eye.backward()
-                self.optimizer_D_eye.step()
+                if self.D_eye:
+                    self.optimizer_D_eye.zero_grad()
+                    # Re-slice eye region for discriminator update
+                    (l_xmin, l_xmax, l_ymin, l_ymax), _ = drv_eye_rects[0]
+                    pred_eye_region = pred_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax].detach()
+                    gt_eye_region = tgt_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax].detach()
+                    loss_d_eye_real = self.criterion_gan(self.D_eye(gt_eye_region), target_is_real=True)
+                    loss_d_eye_fake = self.criterion_gan(self.D_eye(pred_eye_region), target_is_real=False)
+                    loss_d_eye = (loss_d_eye_real + loss_d_eye_fake) * 0.5
+                    loss_d_eye.backward()
+                    self.optimizer_D_eye.step()
 
             meter.update(total_loss.item())
             if i_step % 10 == 0:
@@ -969,12 +1040,12 @@ class LoRATrainer(nn.Module):
         
         # Add discriminators to checkpoint if they exist
         if self.use_adv_loss:
-            state_dict['D_full'] = self.D_full.state_dict()
-            state_dict['D_lip'] = self.D_lip.state_dict()
-            state_dict['D_eye'] = self.D_eye.state_dict()
-            optimizer_states.append(self.optimizer_D_full.state_dict())
-            optimizer_states.append(self.optimizer_D_lip.state_dict())
-            optimizer_states.append(self.optimizer_D_eye.state_dict())
+            if self.D_full: state_dict['D_full'] = self.D_full.state_dict()
+            if self.D_lip: state_dict['D_lip'] = self.D_lip.state_dict()
+            if self.D_eye: state_dict['D_eye'] = self.D_eye.state_dict()
+            if self.optimizer_D_full: optimizer_states.append(self.optimizer_D_full.state_dict())
+            if self.optimizer_D_lip: optimizer_states.append(self.optimizer_D_lip.state_dict())
+            if self.optimizer_D_eye: optimizer_states.append(self.optimizer_D_eye.state_dict())
 
         checkpoint['state_dict'] = state_dict
         checkpoint['lora_args'] = self.lora_args
@@ -1047,11 +1118,14 @@ if __name__ == '__main__':
     parser.add_argument("--mouth_encode_mode", default='none', choices=['none', 'concat', 'add', 'style_latent', 'adain', 'gated', 'film'], help="choose the mouth feature injection mode for the SR module")
     parser.add_argument("--a2m_ckpt", default='', help="checkpoint directory of audio2secc model, if provided test_loop will run unseen audio validation")
     parser.add_argument("--val_audio", default='', help="path to an unseen audio file for additional validation during training")
-    # Advanced Loss arguments
-    parser.add_argument("--lambda_gan", default=0.0, type=float, help="weight for GAN loss. If > 0, enables adversarial training.")
-    parser.add_argument("--lambda_fsm", default=0.0, type=float, help="weight for Feature Style Matching loss.")
-    parser.add_argument("--lambda_comp_lp", default=0.0, type=float, help="weight for Facial Component Perceptual loss.")
+    # Advanced Loss arguments - New flexible system
+    parser.add_argument("--adv_loss_fns", default="", type=str, help="Space-separated list of advanced loss functions to use (e.g., 'gan gan_lip fsm_lip gan_eye fsm_eye comp_lp').")
+    parser.add_argument("--lambda_gan", default=1.0, type=float, help="Generic weight for all GAN losses.")
+    parser.add_argument("--lambda_fsm", default=10.0, type=float, help="Generic weight for all Feature Style Matching losses.")
+    parser.add_argument("--lambda_comp_lp", default=1.0, type=float, help="Weight for Facial Component Perceptual loss.")
     parser.add_argument("--lr_d", default=0.0001, type=float, help="learning rate for discriminators")
+    parser.add_argument("--lambda_lpips", default=0.5, type=float, help="Weight for LPIPS (VGG) perceptual loss. Set to 0 to disable.")
+    parser.add_argument("--lambda_sd", default=0.0, type=float, help="Weight for Stable Diffusion perceptual loss. Set to 0 to disable.")
 
     args = parser.parse_args()
     
@@ -1090,14 +1164,27 @@ if __name__ == '__main__':
             'a2m_ckpt': args.a2m_ckpt,
             'val_audio': args.val_audio,
             # Advanced Loss arguments
+            'adv_loss_fns': args.adv_loss_fns,
             'lambda_gan': args.lambda_gan,
             'lambda_fsm': args.lambda_fsm,
             'lambda_comp_lp': args.lambda_comp_lp,
             'lr_d': args.lr_d,
+            'lambda_lpips': args.lambda_lpips,
+            'lambda_sd': args.lambda_sd,
             }
     if inp['work_dir'] == None:
         video_id = os.path.basename(inp['video_id'])[:-4] if inp['video_id'].endswith((".mp4", ".png", ".jpg", ".jpeg")) else inp['video_id']
-        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}'
+        
+        # Create a descriptive suffix based on enabled losses for automatic work_dir naming
+        loss_suffix_parts = []
+        if inp['adv_loss_fns']:
+            loss_suffix_parts.extend(sorted(inp['adv_loss_fns'].split()))
+        if inp['lambda_sd'] > 0:
+            loss_suffix_parts.append('sdloss')
+        
+        loss_suffix = ('_' + '_'.join(loss_suffix_parts)) if loss_suffix_parts else ''
+        
+        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{loss_suffix}'
     os.makedirs(inp['work_dir'], exist_ok=True)
     trainer = LoRATrainer(inp)
 
