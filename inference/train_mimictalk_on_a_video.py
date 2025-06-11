@@ -158,6 +158,10 @@ class LoRATrainer(nn.Module):
         self.inp = inp
         self.lora_args = {'lora_mode': inp['lora_mode'], 'lora_r': inp['lora_r']}
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Run preprocessing first to ensure all files and configs are available.
+        self.auto_preprocessing(inp)
+
         head_model_dir = inp['head_ckpt']
         torso_model_dir = inp['torso_ckpt']
         model_dir = torso_model_dir if torso_model_dir != '' else head_model_dir
