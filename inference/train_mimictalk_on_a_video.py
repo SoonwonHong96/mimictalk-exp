@@ -250,8 +250,33 @@ class LoRATrainer(nn.Module):
             print("| Frame extraction finished.")
 
         # 3. Fit 3DMM and get landmarks. This will create both coeff_path and lm2d_path
+        # First, ensure landmarks are valid, and regenerate if necessary.
+        if os.path.exists(lm2d_path):
+            try:
+                lms = np.load(lm2d_path)
+                if lms.shape[1] < 468:
+                    print(f"| Found landmark file with incorrect shape: {lms.shape}. Regenerating.")
+                    os.remove(lm2d_path)
+                    if os.path.exists(coeff_path): os.remove(coeff_path)
+            except Exception as e:
+                print(f"| Error loading landmark file, regenerating: {e}")
+                os.remove(lm2d_path)
+                if os.path.exists(coeff_path): os.remove(coeff_path)
+
         if not os.path.exists(coeff_path) or not os.path.exists(lm2d_path):
             print("| Step 3/3: Fitting 3DMM coefficients and extracting landmarks...")
+            # Explicitly extract and save landmarks first
+            if not os.path.exists(lm2d_path):
+                print("|   Extracting landmarks...")
+                from data_gen.utils.mp_feature_extractors.face_landmarker import MediapipeLandmarker, read_video_to_frames
+                landmarker = MediapipeLandmarker()
+                frames = read_video_to_frames(processed_video_path)
+                img_lm478, vid_lm478 = landmarker.extract_lm478_from_frames(frames, anti_smooth_factor=20)
+                lms = landmarker.combine_vid_img_lm478_to_lm478(img_lm478, vid_lm478)
+                os.makedirs(os.path.dirname(lm2d_path), exist_ok=True)
+                np.save(lm2d_path, lms)
+                print(f"|   Landmarks saved to {lm2d_path}")
+
             coeff_dict = fit_3dmm_for_a_video(processed_video_path, save=False)
             os.makedirs(os.path.dirname(coeff_path), exist_ok=True)
             np.save(coeff_path, coeff_dict)
@@ -341,6 +366,17 @@ class LoRATrainer(nn.Module):
         else:
             self.torso_mode = False
             model = OSAvatarSECC_Img2plane(hp=hp, lora_args=self.lora_args)
+
+        # Load checkpoint before marking parameters as trainable
+        lora_ckpt_path = os.path.join(inp['work_dir'], 'checkpoint.ckpt')
+        if os.path.exists(lora_ckpt_path):
+            self.learnable_triplane = nn.Parameter(torch.zeros([1, 3, model.triplane_hid_dim*model.triplane_depth, 256, 256]).float().cuda(), requires_grad=True)
+            model._last_cano_planes = self.learnable_triplane
+            load_ckpt(model, lora_ckpt_path, model_name='model', strict=False)   
+        else:
+            load_ckpt(model, f"{model_dir}", model_name='model', strict=False)   
+        
+        # Now, mark only the LoRA parameters as trainable
         mark_only_lora_as_trainable(model, bias='none')
 
         mode = self.inp.get('mouth_encode_mode', 'none')
@@ -365,14 +401,6 @@ class LoRATrainer(nn.Module):
                 for p in sr_module.mouth_encoder_film.parameters(): p.requires_grad = True
                 for p in sr_module.film_generator.parameters(): p.requires_grad = True
 
-        lora_ckpt_path = os.path.join(inp['work_dir'], 'checkpoint.ckpt')
-        if os.path.exists(lora_ckpt_path):
-            self.learnable_triplane = nn.Parameter(torch.zeros([1, 3, model.triplane_hid_dim*model.triplane_depth, 256, 256]).float().cuda(), requires_grad=True)
-            model._last_cano_planes = self.learnable_triplane
-            load_ckpt(model, lora_ckpt_path, model_name='model', strict=False)   
-        else:
-            load_ckpt(model, f"{model_dir}", model_name='model', strict=False)   
-            
         num_params(model)
         self.model = model 
 

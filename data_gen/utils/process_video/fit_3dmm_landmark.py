@@ -173,8 +173,18 @@ def fit_3dmm_for_a_video(
             print(e)
             return False
         if lms is None:
-            print(f"get None lms_2d, please check whether each frame has one head, exiting... {lm_name}")
-            return False
+            print(f"ERROR: Could not extract landmarks from video: {video_name}. Please ensure the video contains a clearly visible face in all frames.")
+            raise RuntimeError(f"Landmark extraction failed for {video_name}")
+    
+    if lms.shape[1] < 468:
+        error_msg = (
+            f"ERROR: Loaded landmark file '{lm_name}' has an incorrect number of landmarks. "
+            f"Expected >= 468, but got {lms.shape[1]}.\n"
+            f"This usually means you are using a cached, old landmark file from a previous run.\n"
+            f"SOLUTION: Please delete the directory 'data/processed/videos/<video_id>' for this specific video and re-run the script."
+        )
+        raise ValueError(error_msg)
+
     lms = lms[:, :468, :]
     lms = torch.FloatTensor(lms).cuda()
     lms[..., 1] = img_h - lms[..., 1] # flip the height axis
