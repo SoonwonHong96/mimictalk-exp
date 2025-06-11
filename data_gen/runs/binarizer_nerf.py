@@ -317,6 +317,54 @@ class Binarizer:
         np.save(out_fname, ret, allow_pickle=True)
 
 
+def get_eye_rects(lm, H, W):
+    # eye_left
+    x_min, x_max = int(lm[130, 0]), int(lm[243, 0])
+    y_min, y_max = int(lm[27, 1]), int(lm[23, 1])
+    # eye_right
+    x_min_r, x_max_r = int(lm[463, 0]), int(lm[359, 0])
+    y_min_r, y_max_r = int(lm[257, 1]), int(lm[253, 1])
+    return (x_min, x_max, y_min, y_max), (x_min_r, x_max_r, y_min_r, y_max_r)
+
+def create_component_masks_from_landmarks(lm2ds, H, W):
+    """
+    Creates tight polygon masks for lips and eyes using Mediapipe's 478 landmarks.
+    """
+    # Define landmark indices for facial components
+    # https://github.com/google/mediapipe/blob/master/mediapipe/modules/face_geometry/data/canonical_face_model_uv_visualization.png
+    LIP_INDICES = [
+        61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269,
+        267, 0, 37, 39, 40, 185, 78, 95, 88, 178, 87, 14, 317, 402, 318,
+        324, 308, 415, 310, 311, 312, 13
+    ]
+    LEFT_EYE_INDICES = [
+        33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246
+    ]
+    RIGHT_EYE_INDICES = [
+        362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398
+    ]
+
+    num_frames = lm2ds.shape[0]
+    lip_masks = torch.zeros(num_frames, 1, H, W, dtype=torch.float32)
+    eye_masks = torch.zeros(num_frames, 1, H, W, dtype=torch.float32)
+
+    for i in range(num_frames):
+        # Create lip mask
+        lip_pts = lm2ds[i, LIP_INDICES, :2].astype(np.int32)
+        lip_mask_np = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(lip_mask_np, [lip_pts], 255)
+        lip_masks[i, 0] = torch.from_numpy(lip_mask_np > 0).float()
+
+        # Create eye masks (left and right combined)
+        left_eye_pts = lm2ds[i, LEFT_EYE_INDICES, :2].astype(np.int32)
+        right_eye_pts = lm2ds[i, RIGHT_EYE_INDICES, :2].astype(np.int32)
+        eye_mask_np = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(eye_mask_np, [left_eye_pts], 255)
+        cv2.fillPoly(eye_mask_np, [right_eye_pts], 255)
+        eye_masks[i, 0] = torch.from_numpy(eye_mask_np > 0).float()
+
+    return lip_masks, eye_masks
+
 
 if __name__ == '__main__':
     from argparse import ArgumentParser

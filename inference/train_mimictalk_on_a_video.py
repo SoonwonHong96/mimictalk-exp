@@ -29,7 +29,7 @@ from data_gen.utils.process_video.fit_3dmm_landmark import fit_3dmm_for_a_video
 from data_gen.utils.process_video.extract_segment_imgs import decode_segmap_mask_from_image
 from deep_3drecon.secc_renderer import SECC_Renderer
 from data_gen.eg3d.convert_to_eg3d_convention import get_eg3d_convention_camera_pose_intrinsic
-from data_gen.runs.binarizer_nerf import get_lip_rect
+from data_gen.runs.binarizer_nerf import get_lip_rect, get_eye_rects, create_component_masks_from_landmarks
 # Face Parsing 
 from data_gen.utils.mp_feature_extractors.mp_segmenter import MediapipeSegmenter
 from data_gen.utils.process_video.extract_segment_imgs import inpaint_torso_job, extract_background
@@ -43,6 +43,8 @@ import lpips
 from utils.commons.meters import AvgrageMeter
 meter = AvgrageMeter()
 from torch.utils.tensorboard import SummaryWriter
+# New imports for advanced losses
+from modules.losses.gan_loss import MultiScaleDiscriminator, PerceptualLoss, FacialComponentPerceptualLoss, FeatureStyleMatchingLoss, GANLoss
 
 def crop_video_to_16by9(input_file: str, output_file: str):
     """
@@ -164,6 +166,7 @@ class LoRATrainer(nn.Module):
         with open(os.path.join(self.inp['work_dir'], 'config.yaml'), "a") as f:
             f.write(f"\nlora_r: {inp['lora_r']}")
             f.write(f"\nlora_mode: {inp['lora_mode']}")
+            f.write(f"\nmouth_encode_mode: {inp['mouth_encode_mode']}")
             f.write(f"\n")
         self.secc2video_model = self.load_secc2video(model_dir)
         self.secc2video_model.to(device).eval()
@@ -172,7 +175,41 @@ class LoRATrainer(nn.Module):
         self.face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='lm68')
         self.mp_face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='mediapipe')
         # self.camera_selector = KNearestCameraSelector()
+        
+        # Initialize discriminators and advanced losses if enabled
+        self.init_advanced_losses(inp)
+
         self.load_training_data(inp)
+    def init_advanced_losses(self, inp):
+        self.use_adv_loss = inp['lambda_gan'] > 0
+        if not self.use_adv_loss:
+            return
+
+        # Initialize Discriminators
+        self.D_full = MultiScaleDiscriminator(num_D=2).cuda()
+        self.D_lip = MultiScaleDiscriminator(num_D=2).cuda()
+        self.D_eye = MultiScaleDiscriminator(num_D=2).cuda()
+        
+        # Initialize GAN losses
+        self.criterion_gan = GANLoss(gan_mode='hinge').cuda()
+        self.criterion_fsm = FeatureStyleMatchingLoss().cuda()
+        self.criterion_comp_lp = FacialComponentPerceptualLoss(loss_weight=inp['lambda_comp_lp']).cuda()
+        
+        # Initialize Optimizers for Discriminators
+        self.optimizer_D_full = torch.optim.Adam(self.D_full.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
+        self.optimizer_D_lip = torch.optim.Adam(self.D_lip.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
+        self.optimizer_D_eye = torch.optim.Adam(self.D_eye.parameters(), lr=inp['lr_d'], betas=(0.9, 0.999))
+
+        lora_ckpt_path = os.path.join(inp['work_dir'], 'checkpoint.ckpt')
+        if os.path.exists(lora_ckpt_path):
+             print("| Loading discriminators from checkpoint...")
+             load_ckpt(self.D_full, lora_ckpt_path, model_name='D_full', strict=False)
+             load_ckpt(self.D_lip, lora_ckpt_path, model_name='D_lip', strict=False)
+             load_ckpt(self.D_eye, lora_ckpt_path, model_name='D_eye', strict=False)
+             load_ckpt(self.optimizer_D_full, lora_ckpt_path, model_name='optimizer_D_full', strict=False)
+             load_ckpt(self.optimizer_D_lip, lora_ckpt_path, model_name='optimizer_D_lip', strict=False)
+             load_ckpt(self.optimizer_D_eye, lora_ckpt_path, model_name='optimizer_D_eye', strict=False)
+
     def load_secc2video(self, model_dir):
         inp = self.inp
         from modules.real3d.secc_img2plane_torso import OSAvatarSECC_Img2plane, OSAvatarSECC_Img2plane_Torso
@@ -300,13 +337,18 @@ class LoRATrainer(nn.Module):
         eulers = convert_to_tensor(coeff_dict['euler']).reshape([-1,3]).cuda()
         trans = convert_to_tensor(coeff_dict['trans']).reshape([-1,3]).cuda()
         WH = 512 # now we only support 512x512
-        lm2ds = WH * self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cpu().numpy()
+        
+        # Get mediapipe landmarks for mask generation
+        # Note: The original 3dmm fitting process uses its own landmark reconstruction.
+        # For high-quality masks, we re-calculate lm2ds directly from the 3dmm coefficients.
+        mp_lm2ds = self.mp_face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cpu().numpy()
+        mp_lm2ds = mp_lm2ds * WH 
         
         mouth_ref_img = None
         if self.inp.get('mouth_encode_mode', 'none') != 'none':
             # Using 68 landmarks, upper inner lip is 62, lower inner lip is 66.
             # We use the y-coordinate to measure vertical distance.
-            lip_dists = lm2ds[:, 66, 1] - lm2ds[:, 62, 1]
+            lip_dists = mp_lm2ds[:, 66, 1] - mp_lm2ds[:, 62, 1]
             mouth_open_idx = np.argmax(lip_dists)
             print(f"| Found most open mouth frame at index: {mouth_open_idx}")
 
@@ -319,7 +361,7 @@ class LoRATrainer(nn.Module):
                 full_ref_img_bgr = cv2.imread(mouth_ref_img_name)
                 
                 # Get the y-coordinate of the nose tip (landmark 33) and crop below it.
-                nose_tip_y = lm2ds[mouth_open_idx, 33, 1]
+                nose_tip_y = mp_lm2ds[mouth_open_idx, 33, 1]
                 crop_y_start = int(nose_tip_y)
                 
                 # Ensure crop start is within image bounds
@@ -340,28 +382,13 @@ class LoRATrainer(nn.Module):
             else:
                 print(f"| WARNING: Could not find mouth reference image: {mouth_ref_img_name}")
 
-        lip_rects = [get_lip_rect(lm2ds[i], WH, WH) for i in range(len(lm2ds))]
+        lip_rects = [get_lip_rect(mp_lm2ds[i], WH, WH) for i in range(len(mp_lm2ds))]
         kps = self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cuda()
         kps = (kps-0.5) / 0.5 # rescale to -1~1
         kps = torch.cat([kps, torch.zeros([*kps.shape[:-1], 1]).cuda()], dim=-1)
         
-        # Create binary mouth masks from landmarks
-        mouth_masks = []
-        for i in range(len(lm2ds)):
-            # Landmarks 48 to 67 correspond to the outer and inner lips.
-            mouth_lms = lm2ds[i, 48:68, :2]
-            
-            # Create a convex hull from the mouth landmarks to define the mask region.
-            hull = cv2.convexHull(mouth_lms.astype(np.int32))
-            
-            # Draw the filled hull on a black image to create the binary mask.
-            mask = np.zeros((WH, WH), dtype=np.uint8)
-            cv2.drawContours(mask, [hull], 0, (255), -1)
-            
-            # Convert to a float tensor with values 0.0 or 1.0
-            mouth_masks.append(torch.from_numpy(mask > 0).float())
-        
-        mouth_masks = torch.stack(mouth_masks).unsqueeze(1) # Shape: [T, 1, H, W]
+        # Create tight component masks using the new utility
+        lip_masks, eye_masks = create_component_masks_from_landmarks(mp_lm2ds, WH, WH)
         
         camera_ret = get_eg3d_convention_camera_pose_intrinsic({'euler': torch.tensor(coeff_dict['euler']).reshape([-1,3]), 'trans': torch.tensor(coeff_dict['trans']).reshape([-1,3])})
         c2w, intrinsics = camera_ret['c2w'], camera_ret['intrinsics']
@@ -398,9 +425,12 @@ class LoRATrainer(nn.Module):
             'segmaps': segmaps,
             'kps': kps,
             'mouth_ref_img': mouth_ref_img.cuda() if mouth_ref_img is not None else None,
-            'mouth_masks': mouth_masks.cuda(),
+            'lip_masks': lip_masks.cuda(),
+            'eye_masks': eye_masks.cuda(),
         }
         self.ds = ds
+        # Add eye rects for facial component loss
+        self.ds['eye_rects'] = [get_eye_rects(mp_lm2ds[i], WH, WH) for i in range(len(mp_lm2ds))]
         return ds
     
     def training_loop(self, inp):
@@ -466,6 +496,15 @@ class LoRATrainer(nn.Module):
             'secc_reg_loss': inp['secc_reg_loss_w'],
         }
 
+        # Add advanced loss weights if used
+        if self.use_adv_loss:
+            loss_weights['gan_loss'] = inp['lambda_gan']
+            loss_weights['gan_loss_lip'] = inp['lambda_gan']
+            loss_weights['fsm_loss_lip'] = inp['lambda_fsm']
+            loss_weights['gan_loss_eye'] = inp['lambda_gan']
+            loss_weights['fsm_loss_eye'] = inp['lambda_fsm']
+            loss_weights['comp_lpips_loss'] = inp['lambda_comp_lp']
+
         for i_step in tqdm.trange(num_updates+1,desc="training lora..."):
             milestone_steps = []
             # milestone_steps = [100, 200, 500]
@@ -486,9 +525,11 @@ class LoRATrainer(nn.Module):
             segmaps = []
             torso_imgs = []
             drv_lip_rects = []
+            drv_eye_rects = []
             kp_src = []
             kp_drv = []
             mouth_masks_for_batch = []
+            eye_masks_for_batch = []
             for di in drv_idx:
                 # 读取target image
                 if self.torso_mode:
@@ -504,11 +545,6 @@ class LoRATrainer(nn.Module):
                         img = torch.tensor(cv2.imread(img_name)[..., ::-1] / 127.5 - 1).permute(2,0,1).float() # [3, H, W]
                         self.ds['head_imgs'][di] = img
                     gt_imgs.append(self.ds['head_imgs'][di])
-                if self.ds['head_imgs'][di] is None:
-                    img_name = f'data/processed/videos/{video_id}/head_imgs/{format(di, "08d")}.png'
-                    img = torch.tensor(cv2.imread(img_name)[..., ::-1] / 127.5 - 1).permute(2,0,1).float() # [3, H, W]
-                    self.ds['head_imgs'][di] = img
-                head_imgs.append(self.ds['head_imgs'][di])
                 # 使用第一帧的torso作为face v2v的输入
                 if self.ds['torso_imgs'][0] is None:
                     img_name = f'data/processed/videos/{video_id}/inpaint_torso_imgs/{format(0, "08d")}.png'
@@ -530,11 +566,13 @@ class LoRATrainer(nn.Module):
                 segmaps.append(self.ds['segmaps'][di])
                 
                 # Get the pre-computed mouth mask for the current frame
-                mouth_masks_for_batch.append(self.ds['mouth_masks'][di])
+                mouth_masks_for_batch.append(self.ds['lip_masks'][di])
+                eye_masks_for_batch.append(self.ds['eye_masks'][di])
                 
                 _, secc_color = self.secc_renderer(ids[0:1], exps[di:di+1], zero_eulers[0:1], zero_trans[0:1])
                 drv_secc_colors.append(secc_color)
                 drv_lip_rects.append(self.ds['lip_rects'][di])
+                drv_eye_rects.append(self.ds['eye_rects'][di])
                 kp_src.append(self.ds['kps'][0])
                 kp_drv.append(self.ds['kps'][di])
             bg_img = self.ds['bg_img'].unsqueeze(0).repeat([batch_size, 1, 1, 1]).cuda()
@@ -549,6 +587,7 @@ class LoRATrainer(nn.Module):
             cano_secc_color = self.ds['cano_secc_color'].repeat([batch_size, 1, 1, 1])
             src_secc_color = self.ds['src_secc_color'].repeat([batch_size, 1, 1, 1])
             mouth_masks_for_batch = torch.stack(mouth_masks_for_batch).float().cuda()
+            eye_masks_for_batch = torch.stack(eye_masks_for_batch).float().cuda()
             cond = {'cond_cano': cano_secc_color,'cond_src': src_secc_color, 'cond_tgt': drv_secc_color,
                     'ref_torso_img': ref_torso_imgs, 'bg_img': bg_img, 
                     'segmap': segmaps_0, # v2v使用第一帧的torso作为source image来warp
@@ -584,22 +623,40 @@ class LoRATrainer(nn.Module):
             head_mse_loss = (pred_imgs_raw - F.interpolate(head_imgs, size=(neural_rendering_reso,neural_rendering_reso), mode='bilinear', antialias=True)).abs().mean()
             lpips_loss = self.criterion_lpips(pred_imgs, tgt_imgs).mean()
             head_lpips_loss = self.criterion_lpips(pred_imgs_raw, F.interpolate(head_imgs, size=(neural_rendering_reso,neural_rendering_reso), mode='bilinear', antialias=True)).mean()
+            
+            # Prepare for component losses
             lip_mse_loss = 0
             lip_lpips_loss = 0
+            comp_lpips_loss = 0
+
+            # Create masks for facial component loss
+            # eye_mask = torch.zeros_like(pred_imgs[:, 0:1, :, :])
             for i in range(len(drv_idx)):
+                # Lip calculations
                 xmin, xmax, ymin, ymax = drv_lip_rects[i]
                 lip_tgt_imgs = tgt_imgs[i:i+1,:, ymin:ymax,xmin:xmax].contiguous()
                 lip_pred_imgs = pred_imgs[i:i+1,:, ymin:ymax,xmin:xmax].contiguous()
                 try:
-                    lip_mse_loss = lip_mse_loss + (lip_pred_imgs - lip_tgt_imgs).abs().mean()
-                    lip_lpips_loss = lip_lpips_loss + self.criterion_lpips(lip_pred_imgs, lip_tgt_imgs).mean()
-                except: pass 
+                    lip_mse_loss += (lip_pred_imgs - lip_tgt_imgs).abs().mean()
+                    lip_lpips_loss += self.criterion_lpips(lip_pred_imgs, lip_tgt_imgs).mean()
+                except: pass
+
+                # Eye mask for component loss - This part is now simplified
+                # (l_xmin, l_xmax, l_ymin, l_ymax), (r_xmin, r_xmax, r_ymin, r_ymax) = drv_eye_rects[i]
+                # eye_mask[i, 0, l_ymin:l_ymax, l_xmin:l_xmax] = 1
+                # eye_mask[i, 0, r_ymin:r_ymax, r_xmin:r_xmax] = 1
+
+            if self.use_adv_loss:
+                # Use the pre-computed tight eye mask
+                comp_lpips_loss = self.criterion_comp_lp(pred_imgs, tgt_imgs, eye_masks_for_batch)
+                losses['comp_lpips_loss'] = comp_lpips_loss
+
             losses['mse_loss'] = mse_loss
             losses['head_mse_loss'] = head_mse_loss
             losses['lpips_loss'] = lpips_loss
             losses['head_lpips_loss'] = head_lpips_loss
-            losses['lip_mse_loss'] = lip_mse_loss
-            losses['lip_lpips_loss'] = lip_lpips_loss   
+            losses['lip_mse_loss'] = lip_mse_loss / batch_size
+            losses['lip_lpips_loss'] = lip_lpips_loss / batch_size
 
             # eye blink reg loss
             if i_step % 4 == 0:
@@ -640,7 +697,6 @@ class LoRATrainer(nn.Module):
             triplane_reg_loss = (self.learnable_triplane - init_plane).abs().mean()
             losses['triplane_reg_loss'] = triplane_reg_loss
 
-
             ref_id = self.ds['id'][0:1]
             secc_pertube_randn_scale = hparams['secc_pertube_randn_scale']
             perturbed_id = ref_id + torch.randn_like(ref_id) * secc_pertube_randn_scale
@@ -652,13 +708,73 @@ class LoRATrainer(nn.Module):
             secc_reg_loss = torch.nn.functional.l1_loss(drv_secc_color, perturbed_secc)
             losses['secc_reg_loss'] = secc_reg_loss
 
+            ############################################
+            # GAN and Feature Matching Loss Calculation
+            ############################################
+            if self.use_adv_loss:
+                # Generator loss
+                # 1. Full image GAN loss
+                losses['gan_loss'] = self.criterion_gan(self.D_full(pred_imgs), target_is_real=True)
 
-            total_loss = sum([loss_weights[k] * v for k, v in losses.items() if isinstance(v, torch.Tensor) and v.requires_grad])
-            # Update weights
+                # 2. Lip region GAN and FSM loss
+                # Use the first lip rect for simplicity in batch
+                xmin, xmax, ymin, ymax = drv_lip_rects[0]
+                pred_lip_region = pred_imgs[:, :, ymin:ymax, xmin:xmax]
+                gt_lip_region = tgt_imgs[:, :, ymin:ymax, xmin:xmax]
+
+                losses['gan_loss_lip'] = self.criterion_gan(self.D_lip(pred_lip_region), target_is_real=True)
+                
+                pred_lip_feats = self.D_lip.get_features(pred_lip_region)
+                gt_lip_feats = self.D_lip.get_features(gt_lip_region.detach())
+                losses['fsm_loss_lip'] = self.criterion_fsm(pred_lip_feats, gt_lip_feats)
+
+                # 3. Eye region GAN and FSM loss
+                (l_xmin, l_xmax, l_ymin, l_ymax), (r_xmin, r_xmax, r_ymin, r_ymax) = drv_eye_rects[0]
+                # For simplicity, we'll just use the left eye for the component discriminator
+                pred_eye_region = pred_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax]
+                gt_eye_region = tgt_imgs[:, :, l_ymin:l_ymax, l_xmin:l_xmax]
+                
+                losses['gan_loss_eye'] = self.criterion_gan(self.D_eye(pred_eye_region), target_is_real=True)
+
+                pred_eye_feats = self.D_eye.get_features(pred_eye_region)
+                gt_eye_feats = self.D_eye.get_features(gt_eye_region.detach())
+                losses['fsm_loss_eye'] = self.criterion_fsm(pred_eye_feats, gt_eye_feats)
+
+            total_loss = sum([loss_weights.get(k, 1.0) * v for k, v in losses.items() if isinstance(v, torch.Tensor) and v.requires_grad])
+            
+            # Update Generator
             self.optimizer.zero_grad()
             total_loss.backward()
-            self.learnable_triplane.grad.data = self.learnable_triplane.grad.data * self.learnable_triplane.numel()
+            if self.learnable_triplane.grad is not None:
+                self.learnable_triplane.grad.data = self.learnable_triplane.grad.data * self.learnable_triplane.numel()
             self.optimizer.step()
+
+            # Update Discriminators
+            if self.use_adv_loss:
+                # Full Image Discriminator
+                self.optimizer_D_full.zero_grad()
+                loss_d_full_real = self.criterion_gan(self.D_full(tgt_imgs.detach()), target_is_real=True)
+                loss_d_full_fake = self.criterion_gan(self.D_full(pred_imgs.detach()), target_is_real=False)
+                loss_d_full = (loss_d_full_real + loss_d_full_fake) * 0.5
+                loss_d_full.backward()
+                self.optimizer_D_full.step()
+                
+                # Lip Discriminator
+                self.optimizer_D_lip.zero_grad()
+                loss_d_lip_real = self.criterion_gan(self.D_lip(gt_lip_region.detach()), target_is_real=True)
+                loss_d_lip_fake = self.criterion_gan(self.D_lip(pred_lip_region.detach()), target_is_real=False)
+                loss_d_lip = (loss_d_lip_real + loss_d_lip_fake) * 0.5
+                loss_d_lip.backward()
+                self.optimizer_D_lip.step()
+
+                # Eye Discriminator
+                self.optimizer_D_eye.zero_grad()
+                loss_d_eye_real = self.criterion_gan(self.D_eye(gt_eye_region.detach()), target_is_real=True)
+                loss_d_eye_fake = self.criterion_gan(self.D_eye(pred_eye_region.detach()), target_is_real=False)
+                loss_d_eye = (loss_d_eye_real + loss_d_eye_fake) * 0.5
+                loss_d_eye.backward()
+                self.optimizer_D_eye.step()
+
             meter.update(total_loss.item())
             if i_step % 10 == 0:
                 log_line = f"Iter {i_step+1}: total_loss={meter.avg} "
@@ -679,6 +795,15 @@ class LoRATrainer(nn.Module):
         batch_size = 1
         num_samples = len(self.ds['cameras'])
         video_writer = imageio.get_writer(os.path.join(inp['work_dir'], f'val_step{step}.mp4'), fps=25)
+        
+        # Prepare for mouth segmentation debug video
+        lip_rects = self.ds['lip_rects']
+        max_h = max(rect[3] - rect[2] for rect in lip_rects)
+        max_w = max(rect[1] - rect[0] for rect in lip_rects)
+        lip_debug_canvas_size = (max_w * 2, max_h)
+        lip_video_writer = imageio.get_writer(os.path.join(inp['work_dir'], f'val_step{step}_mouth_segmented.mp4'), fps=25)
+        masked_comp_video_writer = imageio.get_writer(os.path.join(inp['work_dir'], f'val_step{step}_masked_components.mp4'), fps=25)
+
         total_iters = min(num_samples, 250)
         video_id = inp['video_id']
         for i in tqdm.trange(total_iters,desc="testing lora..."):
@@ -688,9 +813,11 @@ class LoRATrainer(nn.Module):
             segmaps = []
             torso_imgs = []
             drv_lip_rects = []
+            drv_eye_rects = []
             kp_src = []
             kp_drv = []
             mouth_masks_for_batch = []
+            eye_masks_for_batch = []
             for di in drv_idx:
                 # 读取target image
                 if self.torso_mode:
@@ -720,9 +847,11 @@ class LoRATrainer(nn.Module):
                 segmaps.append(self.ds['segmaps'][0])
                 
                 # Get the pre-computed mouth mask for the current frame
-                mouth_masks_for_batch.append(self.ds['mouth_masks'][di])
-
+                mouth_masks_for_batch.append(self.ds['lip_masks'][di])
+                eye_masks_for_batch.append(self.ds['eye_masks'][di])
+                
                 drv_lip_rects.append(self.ds['lip_rects'][di])
+                drv_eye_rects.append(self.ds['eye_rects'][di])
                 kp_src.append(self.ds['kps'][0])
                 kp_drv.append(self.ds['kps'][di])
             bg_img = self.ds['bg_img'].unsqueeze(0).repeat([batch_size, 1, 1, 1]).cuda()
@@ -732,6 +861,7 @@ class LoRATrainer(nn.Module):
             segmaps = torch.stack(segmaps).float().cuda()
             tgt_imgs = torch.stack(gt_imgs).float().cuda()
             mouth_masks_for_batch = torch.stack(mouth_masks_for_batch).float().cuda()
+            eye_masks_for_batch = torch.stack(eye_masks_for_batch).float().cuda()
             for di in drv_idx:
                 _, secc_color = self.secc_renderer(self.ds['id'][0:1], drv_exps[di:di+1], zero_eulers[0:1], zero_trans[0:1])
                 drv_secc_colors.append(secc_color)
@@ -746,10 +876,46 @@ class LoRATrainer(nn.Module):
             camera = self.ds['cameras'][drv_idx]
             gen_output = self.secc2video_model.forward(img=None, camera=camera, cond=cond, ret={}, cache_backbone=False, use_cached_backbone=True)
             pred_img = gen_output['image']
+            
+            # Create and write mouth segmentation debug frame
+            xmin, xmax, ymin, ymax = lip_rects[i]
+            
+            gt_lip_crop = ((tgt_imgs[0, :, ymin:ymax, xmin:xmax].permute(1, 2, 0) + 1) / 2 * 255).int().cpu().numpy().astype(np.uint8)
+            pred_lip_crop = ((pred_img[0, :, ymin:ymax, xmin:xmax].permute(1, 2, 0) + 1) / 2 * 255).int().cpu().numpy().astype(np.uint8)
+            
+            h, w, _ = gt_lip_crop.shape
+            canvas = np.zeros((max_h, max_w * 2, 3), dtype=np.uint8)
+            
+            canvas[:h, :w] = gt_lip_crop
+            canvas[:h, max_w:max_w + w] = pred_lip_crop
+            
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            cv2.putText(canvas, 'GT', (10, 20), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, 'Pred', (max_w + 10, 20), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            lip_video_writer.append_data(canvas)
+
+            # Create and write masked components debug frame
+            combined_mask = (self.ds['lip_masks'][i:i+1] + self.ds['eye_masks'][i:i+1]).clamp(0, 1).cuda()
+            gt_masked = tgt_imgs * combined_mask
+            pred_masked = pred_img * combined_mask
+            
+            # Make unmasked area black for visualization
+            gt_masked[combined_mask == 0] = -1
+            pred_masked[combined_mask == 0] = -1
+
+            combined_masked_frame = torch.cat([gt_masked, pred_masked], dim=-1)
+            combined_masked_frame_np = ((combined_masked_frame[0].permute(1, 2, 0) + 1) / 2 * 255).int().cpu().numpy().astype(np.uint8)
+            masked_comp_video_writer.append_data(combined_masked_frame_np)
+
             pred_img = ((pred_img.permute(0, 2, 3, 1) + 1)/2 * 255).int().cpu().numpy().astype(np.uint8)
             video_writer.append_data(pred_img[0])
         video_writer.close()
+        lip_video_writer.close()
+        masked_comp_video_writer.close()
         self.model.train()
+        # Optional unseen-audio validation
+        if step != '':
+            self.audio_validation(inp, step)
 
     def masked_error_loss(self, img_pred, img_gt, mask, unmasked_weight=0.1, mode='l1'):
         # 对raw图像，因为deform的原因背景没法全黑，导致这部分mse过高，我们将其mask掉，只计算人脸部分
@@ -800,6 +966,16 @@ class LoRATrainer(nn.Module):
             'learnable_triplane': self.model.state_dict()['_last_cano_planes'],
         }
         del state_dict['model']['_last_cano_planes']
+        
+        # Add discriminators to checkpoint if they exist
+        if self.use_adv_loss:
+            state_dict['D_full'] = self.D_full.state_dict()
+            state_dict['D_lip'] = self.D_lip.state_dict()
+            state_dict['D_eye'] = self.D_eye.state_dict()
+            optimizer_states.append(self.optimizer_D_full.state_dict())
+            optimizer_states.append(self.optimizer_D_lip.state_dict())
+            optimizer_states.append(self.optimizer_D_eye.state_dict())
+
         checkpoint['state_dict'] = state_dict
         checkpoint['lora_args'] = self.lora_args
         person_ds = {}
@@ -818,6 +994,32 @@ class LoRATrainer(nn.Module):
         print(f"| Saved person_ds to {person_ds_path}")
 
         return checkpoint
+
+    def audio_validation(self, inp, step=''):
+        """Run an optional unseen-audio validation using the AdaptGeneFace2Infer pipeline.
+        This simply shells out to `mimictalk_infer.py` reusing the currently trained
+        checkpoint as `--torso_ckpt` and saving the output into work_dir.
+        """
+        a2m_ckpt = inp.get('a2m_ckpt', '')
+        val_audio = inp.get('val_audio', '')
+        if a2m_ckpt == '' or val_audio == '':
+            print("| Skip audio validation – a2m_ckpt or val_audio not provided.")
+            return
+        # Compose command for quick validation
+        out_name = os.path.join(inp['work_dir'], f"val_audio_step{step}.mp4")
+        cmd = (
+            f"python inference/mimictalk_infer.py "
+            f"--a2m_ckpt {a2m_ckpt} "
+            f"--torso_ckpt {inp['work_dir']} "
+            f"--drv_aud {val_audio} "
+            f"--drv_pose static "
+            f"--out_mode final "
+            f"--out_name {out_name} "
+            f"--map_to_init_pose True --temperature 0.3 --denoising_steps 10"
+        )
+        print(f"| Running audio validation: {cmd}")
+        os.system(cmd)
+
 if __name__ == '__main__':
     import argparse, glob, tqdm
     parser = argparse.ArgumentParser()
@@ -843,6 +1045,13 @@ if __name__ == '__main__':
     parser.add_argument("--random_seed", default=None, type=int, help="random seed for reproducibility")
     parser.add_argument("--preprocess_only", action='store_true', help="run preprocessing only and exit")
     parser.add_argument("--mouth_encode_mode", default='none', choices=['none', 'concat', 'add', 'style_latent', 'adain', 'gated', 'film'], help="choose the mouth feature injection mode for the SR module")
+    parser.add_argument("--a2m_ckpt", default='', help="checkpoint directory of audio2secc model, if provided test_loop will run unseen audio validation")
+    parser.add_argument("--val_audio", default='', help="path to an unseen audio file for additional validation during training")
+    # Advanced Loss arguments
+    parser.add_argument("--lambda_gan", default=0.0, type=float, help="weight for GAN loss. If > 0, enables adversarial training.")
+    parser.add_argument("--lambda_fsm", default=0.0, type=float, help="weight for Feature Style Matching loss.")
+    parser.add_argument("--lambda_comp_lp", default=0.0, type=float, help="weight for Facial Component Perceptual loss.")
+    parser.add_argument("--lr_d", default=0.0001, type=float, help="learning rate for discriminators")
 
     args = parser.parse_args()
     
@@ -877,6 +1086,14 @@ if __name__ == '__main__':
             'random_seed': args.random_seed,
             'preprocess_only': args.preprocess_only,
             'mouth_encode_mode': args.mouth_encode_mode,
+            # Audio validation options
+            'a2m_ckpt': args.a2m_ckpt,
+            'val_audio': args.val_audio,
+            # Advanced Loss arguments
+            'lambda_gan': args.lambda_gan,
+            'lambda_fsm': args.lambda_fsm,
+            'lambda_comp_lp': args.lambda_comp_lp,
+            'lr_d': args.lr_d,
             }
     if inp['work_dir'] == None:
         video_id = os.path.basename(inp['video_id'])[:-4] if inp['video_id'].endswith((".mp4", ".png", ".jpg", ".jpeg")) else inp['video_id']
@@ -887,7 +1104,7 @@ if __name__ == '__main__':
     # Initialize the gating network bias if in 'gated' mode
     if inp['mouth_encode_mode'] == 'gated':
         # Use the first batch of mouth masks from the dataset for initialization
-        sample_mask = trainer.ds['mouth_masks'][0:1]
+        sample_mask = trainer.ds['lip_masks'][0:1]
         trainer.secc2video_model.superresolution.initialize_gating_bias(sample_mask)
 
     if inp['preprocess_only']:

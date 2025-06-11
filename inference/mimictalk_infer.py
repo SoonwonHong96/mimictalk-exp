@@ -167,6 +167,7 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
+        self.inp = kwargs.get('inp')
         self.audio2secc_dir = audio2secc_dir
         self.head_model_dir = head_model_dir
         self.torso_model_dir = torso_model_dir
@@ -181,12 +182,19 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
         self.gauss_cache = {}
         self.previous_exp = None
         self.pose_video_frames = None
+        self.gt_video_frames = None
         # self.camera_selector = KNearestCameraSelector()
 
     def load_secc2video(self, head_model_dir, torso_model_dir):
         if torso_model_dir != '':
             config_dir = torso_model_dir if os.path.isdir(torso_model_dir) else os.path.dirname(torso_model_dir)
             set_hparams(f"{config_dir}/config.yaml", print_hparams=False)
+            
+            # Manually override mouth_encode_mode if provided in inference args
+            if self.inp and self.inp.get('mouth_encode_mode') is not None:
+                hparams['mouth_encode_mode'] = self.inp['mouth_encode_mode']
+                print(f"| Manually set mouth_encode_mode to: {hparams['mouth_encode_mode']}")
+
             hparams['htbsr_head_threshold'] = 1.0
             self.secc2video_hparams = copy.deepcopy(hparams)
             ckpt = get_last_checkpoint(torso_model_dir)[0]
@@ -355,6 +363,20 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
         return sample
 
     def infer_once(self, inp):
+        if inp.get('gt_video'):
+            print("| Loading ground truth video for debug visualization...")
+            cap = cv2.VideoCapture(inp['gt_video'])
+            self.gt_video_frames = []
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                self.gt_video_frames.append(frame)
+            cap.release()
+            if not self.gt_video_frames:
+                print(f"| WARNING: Could not load frames from {inp['gt_video']}. Will use static ref image.")
+                self.gt_video_frames = None
+
         if inp['blending']:
             print("| Loading pose video for blending background...")
             cap = cv2.VideoCapture(inp['drv_pose_name'])
@@ -432,55 +454,29 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
         torso_smo_ksize = 7
         drv_kps = smooth_features_xd(drv_kps.reshape([-1, 68*2]), kernel_size=torso_smo_ksize).reshape([-1, 68, 2])
 
-        # forward renderer
-        img_raw_lst = []
-        img_lst = []
-        depth_img_lst = []
-        with torch.no_grad():
-            for i in tqdm.trange(num_frames, desc="MimicTalk is rendering frames"):
-                kp_src = torch.cat([src_kps[i:i+1].reshape([1, 68, 2]), torch.zeros([1, 68,1]).to(src_kps.device)],dim=-1)
-                kp_drv = torch.cat([drv_kps[i:i+1].reshape([1, 68, 2]), torch.zeros([1, 68,1]).to(drv_kps.device)],dim=-1)
-                cond={'cond_cano': cano_secc_color,'cond_src': src_secc_color, 'cond_tgt': drv_secc_colors[i:i+1].cuda(),
-                        'ref_torso_img': ref_torso_img, 'bg_img': bg_img, 'segmap': segmap,
-                        'kp_s': kp_src, 'kp_d': kp_drv}
-
-                ########################################################################################################
-                ### 相比real3d_infer只修改了这行👇，即cano_triplane来自cache里的learnable_triplane,而不是img预测的plane ####
-                ########################################################################################################
-                gen_output = self.secc2video_model.forward(img=None, camera=camera[i:i+1], cond=cond, ret={}, cache_backbone=False, use_cached_backbone=True)
-                
-                img_lst.append(gen_output['image'])
-                img_raw_lst.append(gen_output['image_raw'])
-                depth_img_lst.append(gen_output['image_depth'])
-
-        # save demo video
-        depth_imgs = torch.cat(depth_img_lst)
-        imgs = torch.cat(img_lst)
-        imgs_raw = torch.cat(img_raw_lst)
-        secc_img = torch.cat([torch.nn.functional.interpolate(drv_secc_colors[i:i+1], (512,512)) for i in range(num_frames)])
+        # Prepare video writers
+        import imageio
+        import uuid
+        temp_video_path = f'infer_out/tmp/{uuid.uuid1()}.mp4'
+        os.makedirs(os.path.dirname(temp_video_path), exist_ok=True)
+        video_writer = imageio.get_writer(temp_video_path, fps=25, format='FFMPEG', codec='h264')
         
-        if inp['out_mode'] == 'concat_debug':
-            secc_img = secc_img.cpu()
-            secc_img = ((secc_img + 1) * 127.5).permute(0, 2, 3, 1).int().numpy()
+        secc_writer = None
+        if inp.get('save_secc_video', False):
+            if inp['out_name'] != '':
+                base, ext = os.path.splitext(inp['out_name'])
+                secc_out_fname = base + '_secc.mp4'
+            else:
+                drv_name = os.path.basename(inp['drv_audio_name']).split('.')[0]
+                secc_out_fname = os.path.join('infer_out', drv_name + '_secc.mp4')
+            os.makedirs(os.path.dirname(secc_out_fname), exist_ok=True)
+            secc_writer = imageio.get_writer(secc_out_fname, fps=25, format='FFMPEG', codec='h264')
 
-            depth_img = F.interpolate(depth_imgs, (512,512)).cpu()
-            depth_img = depth_img.repeat([1,3,1,1])
-            depth_img = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min())
-            depth_img = depth_img * 2 - 1
-            depth_img = depth_img.clamp(-1,1)
-
-            secc_img = secc_img / 127.5 - 1
-            secc_img = torch.from_numpy(secc_img).permute(0, 3, 1, 2)
-            imgs = torch.cat([ref_img_gt.repeat([imgs.shape[0],1,1,1]).cpu(), secc_img, F.interpolate(imgs_raw, (512,512)).cpu(), depth_img, imgs.cpu()], dim=-1)
-        elif inp['out_mode'] == 'final':
-            imgs = imgs.cpu()
-        elif inp['out_mode'] == 'debug':
-            raise NotImplementedError("to do: save separate videos")
-        imgs = imgs.clamp(-1,1)
-
+        # Prepare for blending if enabled
+        bg_frames_tensor = None
         if inp['blending'] and self.pose_video_frames:
             print("| Applying advanced blending with pose video background...")
-            num_frames_to_render = len(imgs)
+            num_frames_to_render = num_frames
             len_pose_video = len(self.pose_video_frames)
             
             bg_frames_batch = []
@@ -495,43 +491,104 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
             
             bg_frames_tensor = torch.stack(bg_frames_batch)
 
-            coordinate_lm2ds = vis_lm2ds_to_coordinate(batch['drv_kp'], hw=512)
-            crop_positions = (inp['offset_x'], inp['offset_y'])
+        with torch.no_grad():
+            for i in tqdm.trange(num_frames, desc="MimicTalk is rendering frames"):
+                kp_src = torch.cat([src_kps[i:i+1].reshape([1, 68, 2]), torch.zeros([1, 68,1]).to(src_kps.device)],dim=-1)
+                kp_drv = torch.cat([drv_kps[i:i+1].reshape([1, 68, 2]), torch.zeros([1, 68,1]).to(drv_kps.device)],dim=-1)
+                cond={'cond_cano': cano_secc_color,'cond_src': src_secc_color, 'cond_tgt': drv_secc_colors[i:i+1].cuda(),
+                        'ref_torso_img': ref_torso_img, 'bg_img': bg_img, 'segmap': segmap,
+                        'kp_s': kp_src, 'kp_d': kp_drv}
+                
+                gen_output = self.secc2video_model.forward(img=None, camera=camera[i:i+1], cond=cond, ret={}, cache_backbone=False, use_cached_backbone=True)
+                
+                # Process and write frame by frame
+                img = gen_output['image']
 
-            blended_imgs, self.gauss_cache = combine_images_with_mouth_mask_gpt(
+                if secc_writer:
+                    secc_img = F.interpolate(drv_secc_colors[i:i+1], (512,512))
+                    secc_img_to_save = ((secc_img.cpu() + 1) / 2).clamp(0, 1)
+                    secc_out_img = (secc_img_to_save.permute(0, 2, 3, 1) * 255).int().cpu().numpy().astype(np.uint8)
+                    secc_writer.append_data(secc_out_img[0])
+                
+                if inp['out_mode'] == 'concat_debug':
+                    img_raw = gen_output['image_raw']
+                    depth_img = gen_output['image_depth']
+                    secc_img_debug = F.interpolate(drv_secc_colors[i:i+1], (512,512))
+                    
+                    # Prepare GT frame
+                    if self.gt_video_frames:
+                        len_gt_video = len(self.gt_video_frames)
+                        src_idx = mirror_index(i, len_gt_video)
+                        frame_bgr = self.gt_video_frames[src_idx]
+                        frame_resized = cv2.resize(frame_bgr, (512, 512))
+                        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                        gt_frame = (torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 127.5 - 1).unsqueeze(0)
+                    else:
+                        gt_frame = ref_img_gt.cpu() # Fallback
+                    
+                    # Prepare other debug columns
+                    secc_img_for_debug = ((secc_img_debug.cpu() + 1) / 2).clamp(0, 1) * 2 - 1
+                    
+                    depth_img_for_debug = F.interpolate(depth_img, (512,512)).cpu()
+                    depth_img_for_debug = depth_img_for_debug.repeat([1,3,1,1])
+                    # Normalize and invert the depth map
+                    normalized_depth = (depth_img_for_debug - depth_img_for_debug.min()) / (depth_img_for_debug.max() - depth_img_for_debug.min() + 1e-6)
+                    inverted_depth = 1.0 - normalized_depth
+                    depth_img_for_debug = (inverted_depth * 2 - 1).clamp(-1,1)
+
+                    # Assemble in new order: [GT, SECC, Depth, RawHead, Final]
+                    processed_frame = torch.cat([
+                        gt_frame,
+                        secc_img_for_debug,
+                        depth_img_for_debug,
+                        F.interpolate(img_raw, (512,512)).cpu(),
+                        img.cpu()
+                    ], dim=-1)
+                elif inp['out_mode'] == 'final':
+                    processed_frame = img.cpu()
+
+                if bg_frames_tensor is not None:
+                    coordinate_lm2ds = vis_lm2ds_to_coordinate(batch['drv_kp'][i:i+1], hw=512)
+            crop_positions = (inp['offset_x'], inp['offset_y'])
+                    blended_frame, self.gauss_cache = combine_images_with_mouth_mask_gpt(
                 self.gauss_cache, 
-                bg_frames_tensor, 
-                (imgs + 1) / 2,
+                        bg_frames_tensor[i:i+1],
+                        (processed_frame + 1) / 2,
                 coordinate_lm2ds,
                 crop_positions=crop_positions
             )
-            imgs = (blended_imgs * 2) - 1 # Convert back to [-1, 1] range for consistency
-        
-        imgs = (imgs + 1) / 2
-        imgs = imgs.clamp(0,1)
+                    processed_frame = (blended_frame * 2) - 1
 
-        import imageio
-        import uuid
-        debug_name = f'{uuid.uuid1()}.mp4'
-        out_imgs = ((imgs.permute(0, 2, 3, 1) + 1)/2 * 255).int().cpu().numpy().astype(np.uint8)
-        writer = imageio.get_writer(debug_name, fps=25, format='FFMPEG', codec='h264')
-        for i in tqdm.trange(len(out_imgs), desc="Imageio is saving video"):
-            writer.append_data(out_imgs[i])
-        writer.close()
+                out_frame_np = ((processed_frame.clamp(-1,1) + 1) / 2 * 255).permute(0, 2, 3, 1).int().cpu().numpy().astype(np.uint8)
+                video_writer.append_data(out_frame_np[0])
+
+        video_writer.close()
+        if secc_writer:
+            secc_writer.close()
+            print(f"| Saved driving SECC video to {secc_out_fname}")
         
-        out_fname = 'infer_out/tmp/' + os.path.basename(inp['drv_pose_name'])[:-4] + '.mp4' if inp['out_name'] == '' else inp['out_name']
+        if inp['out_name'] == '':
+            torso_ckpt_name = os.path.basename(os.path.normpath(inp['torso_ckpt']))
+            audio_name = os.path.basename(inp['drv_audio_name']).split('.')[0]
+            
+            # Add suffix for debug mode to make it explicit
+            suffix = '_debug' if inp['out_mode'] == 'concat_debug' else ''
+
+            out_fname = os.path.join('infer_out', audio_name, f"{torso_ckpt_name}{suffix}.mp4")
+        else:
+            out_fname = inp['out_name']
+
         try:
             os.makedirs(os.path.dirname(out_fname), exist_ok=True)
         except: pass
         if inp['drv_audio_name'][-4:] in ['.wav', '.mp3']:
-            # os.system(f"ffmpeg -i {debug_name} -i {inp['drv_audio_name']} -y -v quiet -shortest {out_fname}")
-            cmd = f"/usr/bin/ffmpeg -i {debug_name} -i {self.wav16k_name} -y -r 25 -ar 16000 -c:v copy -c:a libmp3lame -pix_fmt yuv420p -b:v 2000k  -strict experimental -shortest {out_fname}"
+            cmd = f"/usr/bin/ffmpeg -i {temp_video_path} -i {self.wav16k_name} -y -r 25 -ar 16000 -c:v copy -c:a libmp3lame -pix_fmt yuv420p -b:v 2000k  -strict experimental -shortest {out_fname}"
             os.system(cmd)
-            os.system(f"rm {debug_name}")
+            os.system(f"rm {temp_video_path}")
         else:
-            ret = os.system(f"ffmpeg -i {debug_name} -i {inp['drv_audio_name']} -map 0:v -map 1:a -y -v quiet -shortest {out_fname}")
-            if ret != 0: # 没有成功从drv_audio_name里面提取到音频, 则直接输出无音频轨道的纯视频
-                os.system(f"mv {debug_name} {out_fname}")
+            ret = os.system(f"ffmpeg -i {temp_video_path} -i {inp['drv_audio_name']} -map 0:v -map 1:a -y -v quiet -shortest {out_fname}")
+            if ret != 0: 
+                os.system(f"mv {temp_video_path} {out_fname}")
         print(f"Saved at {out_fname}")
         return out_fname
 
@@ -556,6 +613,9 @@ if __name__ == '__main__':
     parser.add_argument("--seed", default=None, type=int) # random seed, default None to use time.time()
     parser.add_argument("--smoothing", action='store_true', help="Enable stateful smoothing between chunks.")
     parser.add_argument("--blending", action='store_true', help="Enable advanced blending with color correction.")
+    parser.add_argument("--mouth_encode_mode", default=None, type=str, choices=['none', 'concat', 'add', 'style_latent', 'adain', 'gated', 'film'], help="Manually specify the mouth feature injection mode if it's missing from the config")
+    parser.add_argument("--save_secc_video", action='store_true', help="Save a separate video of the driving SECC for debugging.")
+    parser.add_argument("--gt_video", default=None, type=str, help="Optional ground truth video for the first column in debug mode.")
  
     args = parser.parse_args()
 
@@ -578,6 +638,9 @@ if __name__ == '__main__':
             'seed': args.seed,
             'smoothing': args.smoothing,
             'blending': args.blending,
+            'mouth_encode_mode': args.mouth_encode_mode,
+            'save_secc_video': args.save_secc_video,
+            'gt_video': args.gt_video,
             }
     print(f"args.smoothing: {args.smoothing}")
     print(f"args.blending: {args.blending}")
