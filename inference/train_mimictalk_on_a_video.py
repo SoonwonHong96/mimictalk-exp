@@ -157,34 +157,48 @@ class LoRATrainer(nn.Module):
         super().__init__()
         self.inp = inp
         self.lora_args = {'lora_mode': inp['lora_mode'], 'lora_r': inp['lora_r']}
+
+    def setup(self):
+        """
+        Main setup function to orchestrate preprocessing, model loading, and data loading.
+        """
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        # Run preprocessing first to ensure all files and configs are available.
-        self.auto_preprocessing(inp)
+        # 1. Run preprocessing first to ensure all files and configs are available.
+        self.auto_preprocessing(self.inp)
 
-        head_model_dir = inp['head_ckpt']
-        torso_model_dir = inp['torso_ckpt']
+        # 2. Load the main model now that config is guaranteed to exist.
+        head_model_dir = self.inp['head_ckpt']
+        torso_model_dir = self.inp['torso_ckpt']
         model_dir = torso_model_dir if torso_model_dir != '' else head_model_dir
-        cmd = f"cp {os.path.join(model_dir, 'config.yaml')} {self.inp['work_dir']}"
-        print(cmd)
-        os.system(cmd)
-        with open(os.path.join(self.inp['work_dir'], 'config.yaml'), "a") as f:
-            f.write(f"\nlora_r: {inp['lora_r']}")
-            f.write(f"\nlora_mode: {inp['lora_mode']}")
-            f.write(f"\nmouth_encode_mode: {inp['mouth_encode_mode']}")
-            f.write(f"\n")
+        
+        # We need to copy the config first to set up hparams for model loading
+        config_path = os.path.join(self.inp['work_dir'], 'config.yaml')
+        if not os.path.exists(config_path):
+             cmd = f"cp {os.path.join(model_dir, 'config.yaml')} {self.inp['work_dir']}"
+             print(cmd)
+             os.system(cmd)
+             with open(config_path, "a") as f:
+                f.write(f"\nlora_r: {self.inp['lora_r']}")
+                f.write(f"\nlora_mode: {self.inp['lora_mode']}")
+                f.write(f"\nmouth_encode_mode: {self.inp['mouth_encode_mode']}")
+                f.write(f"\n")
+
         self.secc2video_model = self.load_secc2video(model_dir)
         self.secc2video_model.to(device).eval()
+
+        # 3. Initialize helper classes
         self.seg_model = MediapipeSegmenter()
         self.secc_renderer = SECC_Renderer(512)
         self.face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='lm68')
         self.mp_face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='mediapipe')
         
-        # Initialize discriminators and advanced losses if enabled
-        self.init_perceptual_losses(inp)
-        self.init_advanced_losses(inp)
+        # 4. Initialize loss functions
+        self.init_perceptual_losses(self.inp)
+        self.init_advanced_losses(self.inp)
 
-        self.load_training_data(inp)
+        # 5. Load the actual training data
+        self.load_training_data(self.inp)
 
     def auto_preprocessing(self, inp):
         video_id = os.path.basename(inp['video_id'])
@@ -1212,6 +1226,7 @@ if __name__ == '__main__':
         inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{lora_suffix}{loss_suffix}'
     os.makedirs(inp['work_dir'], exist_ok=True)
     trainer = LoRATrainer(inp)
+    trainer.setup() # Call the new setup method
 
     # Initialize the gating network bias if in 'gated' mode
     if inp['mouth_encode_mode'] == 'gated':
