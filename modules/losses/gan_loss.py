@@ -78,8 +78,8 @@ class FeatureStyleMatchingLoss(nn.Module):
 
     def forward(self, real_feats, fake_feats):
         loss = 0
-        for real_feats_d, fake_feats_d in zip(real_feats, fake_feats):
-            for real_feat, fake_feat in zip(real_feats_d, fake_feats_d):
+        for real_feat_pyramid, fake_feat_pyramid in zip(real_feats, fake_feats):
+            for real_feat, fake_feat in zip(real_feat_pyramid, fake_feat_pyramid):
                 loss += self.criterion(self.gram(real_feat), self.gram(fake_feat))
         return loss * self.loss_weight
 

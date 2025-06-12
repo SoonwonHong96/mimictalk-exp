@@ -198,3 +198,7 @@ deep_3drecon/BFM/mediapipe_in_bfm53201.npy
 deep_3drecon/BFM/std_exp.txt
 !data/raw/examples/*
 checkpoints_mimictalk
+<<<<<<< HEAD
+=======
+*.zip
+>>>>>>> 8829ba69e8c2898a43ceb31b388a26a931d5e250

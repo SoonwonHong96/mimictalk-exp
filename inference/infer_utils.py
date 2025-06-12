@@ -14,7 +14,7 @@ def smooth_features_xd_gaussian(
     kernel_size: int = 5,
     strength: float = 1.0,
     kernel_type: str = "gaussian",
-    sigma: float | None = None,
+    sigma: float = None,
 ):
     """
     Temporal smoothing of feature maps.
