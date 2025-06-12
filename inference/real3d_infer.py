@@ -11,6 +11,7 @@ import tqdm
 import copy
 import cv2
 import math
+import subprocess
 
 # common utils
 from utils.commons.hparams import hparams, set_hparams
@@ -590,10 +591,14 @@ class GeneFace2Infer:
         import uuid
         wav16k_name = audio_name[:-4] + f'{uuid.uuid1()}_16k.wav'
         self.wav16k_name = wav16k_name
-        extract_wav_cmd = f"ffmpeg -i {audio_name} -f wav -ar 16000 -v quiet -y {wav16k_name} -y"
-        # extract_wav_cmd = f"ffmpeg -i {audio_name} -f wav -ar 16000 -y {wav16k_name} -y"
+        extract_wav_cmd = f"ffmpeg -i {audio_name} -f wav -ar 16000 -y {wav16k_name}"
         print(extract_wav_cmd)
-        os.system(extract_wav_cmd)
+        result = subprocess.run(extract_wav_cmd, shell=True, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("ffmpeg command failed!")
+            print("Stdout:", result.stdout)
+            print("Stderr:", result.stderr)
+            raise RuntimeError(f"ffmpeg failed to execute command: {extract_wav_cmd}")
         print(f"Extracted wav file (16khz) from {audio_name} to {wav16k_name}.")
 
     def get_f0(self, wav16k_name):
