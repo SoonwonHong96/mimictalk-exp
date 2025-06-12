@@ -1,7 +1,7 @@
 # big files
 data_util/face_tracking/3DMM/01_MorphableModel.mat
 data_util/face_tracking/3DMM/3DMM_info.npy
-
+*.zip
 !/deep_3drecon/BFM/.gitkeep
 deep_3drecon/BFM/Exp_Pca.bin
 deep_3drecon/BFM/01_MorphableModel.mat

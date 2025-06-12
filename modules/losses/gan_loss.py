@@ -78,8 +78,9 @@ class FeatureStyleMatchingLoss(nn.Module):
 
     def forward(self, real_feats, fake_feats):
         loss = 0
-        for real_feat, fake_feat in zip(real_feats, fake_feats):
-            loss += self.criterion(self.gram(real_feat), self.gram(fake_feat))
+        for real_feats_d, fake_feats_d in zip(real_feats, fake_feats):
+            for real_feat, fake_feat in zip(real_feats_d, fake_feats_d):
+                loss += self.criterion(self.gram(real_feat), self.gram(fake_feat))
         return loss * self.loss_weight
 
 class MultiScaleDiscriminator(nn.Module):
