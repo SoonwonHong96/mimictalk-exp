@@ -588,6 +588,14 @@ class LoRATrainer(nn.Module):
             milestone_steps = []
             # milestone_steps = [100, 200, 500]
             if i_step % 1000 == 0 or i_step in milestone_steps:
+                # Save a checkpoint BEFORE running validation, especially for step 0
+                if i_step == 0:
+                    filepath = os.path.join(inp['work_dir'], f"model_ckpt_steps_{i_step}.ckpt") 
+                    checkpoint = self.dump_checkpoint(inp)
+                    tmp_path = str(filepath) + ".part"
+                    torch.save(checkpoint, tmp_path, _use_new_zipfile_serialization=False)
+                    os.replace(tmp_path, filepath)
+
                 trainer.test_loop(inp, step=i_step)
                 if i_step != 0:
                     filepath = os.path.join(inp['work_dir'], f"model_ckpt_steps_{i_step}.ckpt") 
@@ -1051,8 +1059,8 @@ class LoRATrainer(nn.Module):
         eye_mask_video_writer.close()
         self.model.train()
         # Optional unseen-audio validation
-        if step != '':
-            self.audio_validation(inp, step)
+        self.audio_validation(inp, step)
+        print("| Audio validation done")
 
     def masked_error_loss(self, img_pred, img_gt, mask, unmasked_weight=0.1, mode='l1'):
         # 对raw图像，因为deform的原因背景没法全黑，导致这部分mse过高，我们将其mask掉，只计算人脸部分
@@ -1142,16 +1150,23 @@ class LoRATrainer(nn.Module):
         if a2m_ckpt == '' or val_audio == '':
             print("| Skip audio validation – a2m_ckpt or val_audio not provided.")
             return
+            
+        # Find the latest checkpoint in the current work directory
+        latest_ckpt, _ = get_last_checkpoint(inp['work_dir'])
+        if latest_ckpt is None:
+            print(f"| Skip audio validation – no checkpoint found in {inp['work_dir']}.")
+            return
+
         # Compose command for quick validation
         out_name = os.path.join(inp['work_dir'], f"val_audio_step{step}.mp4")
         cmd = (
             f"python inference/mimictalk_infer.py "
             f"--a2m_ckpt {a2m_ckpt} "
-            f"--torso_ckpt {inp['work_dir']} "
-            f"--drv_aud {val_audio} "
+            f"--torso_ckpt \"{inp['work_dir']}\" " # Pass the specific checkpoint file
+            f"--drv_aud \"{val_audio}\" "
             f"--drv_pose static "
-            f"--out_mode final "
-            f"--out_name {out_name} "
+            f"--out_mode concat_debug "
+            f"--out_name \"{out_name}\" "
             f"--map_to_init_pose True --temperature 0.3 --denoising_steps 10"
         )
         print(f"| Running audio validation: {cmd}")
@@ -1165,7 +1180,7 @@ if __name__ == '__main__':
     parser.add_argument("--torso_ckpt", default='checkpoints/mimictalk_orig/os_secc2plane_torso') # checkpoints/0729_th1kh/secc_img2plane checkpoints/0720_img2planes/secc_img2plane_two_stage
     parser.add_argument("--video_id", default='data/raw/examples/German_20s.mp4', help="identity source, we support (1) already processed <video_id> of GeneFace, (2) video path, (3) image path")
     parser.add_argument("--work_dir", default=None) 
-    parser.add_argument("--max_updates", default=2000, type=int, help="for video, 2000 is good; for an image, 3~10 is good") 
+    parser.add_argument("--max_updates", default=4000, type=int, help="for video, 2000 is good; for an image, 3~10 is good") 
     parser.add_argument("--test", action='store_true') 
     parser.add_argument("--batch_size", default=1, type=int, help="batch size during training, 1 needs 8GB, 2 needs 15GB") 
     parser.add_argument("--lr", default=0.001, type=float) 
@@ -1182,8 +1197,8 @@ if __name__ == '__main__':
     parser.add_argument("--random_seed", default=None, type=int, help="random seed for reproducibility")
     parser.add_argument("--preprocess_only", action='store_true', help="run preprocessing only and exit")
     parser.add_argument("--mouth_encode_mode", default='none', choices=['none', 'concat', 'add', 'style_latent', 'adain', 'gated', 'film'], help="choose the mouth feature injection mode for the SR module")
-    parser.add_argument("--a2m_ckpt", default='', help="checkpoint directory of audio2secc model, if provided test_loop will run unseen audio validation")
-    parser.add_argument("--val_audio", default='', help="path to an unseen audio file for additional validation during training")
+    parser.add_argument("--a2m_ckpt", default='checkpoints/240112_icl_audio2secc_vox2_cmlr', help="checkpoint directory of audio2secc model, if provided test_loop will run unseen audio validation")
+    parser.add_argument("--val_audio", default='data/raw/examples/10s.wav', help="path to an unseen audio file for additional validation during training")
     # Advanced Loss arguments - New flexible system
     parser.add_argument("--adv_loss_fns", default="", type=str, help="Space-separated list of advanced loss functions to use (e.g., 'gan gan_lip fsm_lip comp_lp comp_lp_eye comp_lp_lip').")
     parser.add_argument("--lambda_gan", default=1.0, type=float, help="Generic weight for all GAN losses.")

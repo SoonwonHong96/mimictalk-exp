@@ -19,10 +19,13 @@ class SDPerceptualLoss(nn.Module):
         print("| Loading Stable Diffusion for perceptual loss...")
         self.vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(self.device)
         self.unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(self.device)
-        
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(self.device)
+
         # Freeze the models
         self.vae.requires_grad_(False)
         self.unet.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
         
         # Scheduler for adding noise
         self.scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
@@ -37,6 +40,8 @@ class SDPerceptualLoss(nn.Module):
         t: timestep
         """
         # We are interested in the features from the down-sampling blocks
+        # First, pass through the input convolution
+        x = self.unet.conv_in(x)
         features = []
         for module in self.unet.down_blocks:
             x, res_samples = module(hidden_states=x, temb=t, encoder_hidden_states=text_embeds)
@@ -49,11 +54,9 @@ class SDPerceptualLoss(nn.Module):
         """
         # We need a dummy text embedding for the conditional U-Net
         # An empty prompt is sufficient as we only care about the visual features.
-        tokenizer = CLIPTokenizer.from_pretrained("laion/CLIP-ViT-L-14-laion2B-s32B-b82K")
-        text_encoder = CLIPTextModel.from_pretrained("laion/CLIP-ViT-L-14-laion2B-s32B-b82K").to(self.device)
-        text_input = tokenizer("", padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        text_input = self.tokenizer("", padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
         with torch.no_grad():
-            text_embeds = text_encoder(text_input.input_ids.to(self.device))[0]
+            text_embeds = self.text_encoder(text_input.input_ids.to(self.device))[0]
         
         # Encode images to latent space using the VAE
         # The VAE expects input in [0, 1] range, so we scale it.

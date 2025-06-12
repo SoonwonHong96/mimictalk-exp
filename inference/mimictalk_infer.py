@@ -549,7 +549,7 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
 
                 if bg_frames_tensor is not None:
                     coordinate_lm2ds = vis_lm2ds_to_coordinate(batch['drv_kp'][i:i+1], hw=512)
-            crop_positions = (inp['offset_x'], inp['offset_y'])
+                    crop_positions = (inp['offset_x'], inp['offset_y'])
                     blended_frame, self.gauss_cache = combine_images_with_mouth_mask_gpt(
                 self.gauss_cache, 
                         bg_frames_tensor[i:i+1],
