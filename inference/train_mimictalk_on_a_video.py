@@ -1178,7 +1178,7 @@ if __name__ == '__main__':
     parser.add_argument("--head_ckpt", default='') # checkpoints/0729_th1kh/secc_img2plane checkpoints/0720_img2planes/secc_img2plane_two_stage
     # parser.add_argument("--torso_ckpt", default='checkpoints/240210_real3dportrait_orig/secc2plane_torso_orig') # checkpoints/0729_th1kh/secc_img2plane checkpoints/0720_img2planes/secc_img2plane_two_stage
     parser.add_argument("--torso_ckpt", default='checkpoints/mimictalk_orig/os_secc2plane_torso') # checkpoints/0729_th1kh/secc_img2plane checkpoints/0720_img2planes/secc_img2plane_two_stage
-    parser.add_argument("--video_id", default='data/raw/examples/German_20s.mp4', help="identity source, we support (1) already processed <video_id> of GeneFace, (2) video path, (3) image path")
+    parser.add_argument("--video_id", default='data/raw/examples/id2.mp4', help="identity source, we support (1) already processed <video_id> of GeneFace, (2) video path, (3) image path")
     parser.add_argument("--work_dir", default=None) 
     parser.add_argument("--max_updates", default=4000, type=int, help="for video, 2000 is good; for an image, 3~10 is good") 
     parser.add_argument("--test", action='store_true') 
