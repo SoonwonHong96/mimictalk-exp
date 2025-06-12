@@ -327,8 +327,7 @@ class SynthesisLayer(torch.nn.Module):
         pad_hi = pad_total - pad_lo
         self.padding = [int(pad_lo[0]), int(pad_hi[0]), int(pad_lo[1]), int(pad_hi[1])]
 
-    def forward(self, x, w, noise_mode='random', force_fp32=False, update_emas=False):
-        assert noise_mode in ['random', 'const', 'none'] # unused
+    def forward(self, x, w, force_fp32=False, update_emas=False, **kwargs):
         misc.assert_shape(x, [None, self.in_channels, int(self.in_size[1]), int(self.in_size[0])])
         misc.assert_shape(w, [x.shape[0], self.w_dim])
 

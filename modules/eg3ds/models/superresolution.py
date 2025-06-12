@@ -328,6 +328,48 @@ class LargeSynthesisBlock1(nn.Module):
         rgb = rgb + self.to_rgb(x)
         return x, rgb
     
+class AFBlockAdapter(nn.Module):
+    """
+    An adapter to make a StyleGAN3 AFSynthesisLayer behave like a StyleGAN2 SynthesisBlock.
+    It takes (x, rgb, ws) and returns (x, rgb_out), hiding the internal complexity of
+    calling the main alias-free layer and its corresponding to-rgb layer.
+    """
+    def __init__(self, af_layer, torgb_layer, resample_filter):
+        super().__init__()
+        self.af_layer = af_layer
+        self.torgb_layer = torgb_layer
+        self.register_buffer('resample_filter', resample_filter)
+
+    def forward(self, x, rgb, ws, **block_kwargs):
+        # AFSynthesisLayer expects a single w, not the whole ws stack.
+        # We'll use the first w in the sequence for this block.
+        # The original StyleGAN2 block iterates through ws, but here we simplify
+        # as the calling context only provides 3 ws vectors anyway.
+        w = ws[:, 0, :]
+
+        # Filter forward kwargs to be compatible with AFSynthesisLayer's forward method.
+        af_forward_kwargs = {}
+        if 'force_fp32' in block_kwargs:
+            af_forward_kwargs['force_fp32'] = block_kwargs['force_fp32']
+        if 'update_emas' in block_kwargs:
+            af_forward_kwargs['update_emas'] = block_kwargs['update_emas']
+
+        # Main feature processing
+        x = self.af_layer(x, w, **af_forward_kwargs)
+        
+        # Get the RGB output for this stage
+        new_rgb = self.torgb_layer(x, w, **af_forward_kwargs)
+
+        # Combine with previous RGB output, upsampling if necessary
+        if rgb is not None:
+            if rgb.shape[-1] != new_rgb.shape[-1]:
+                rgb = upfirdn2d.upsample2d(rgb, self.resample_filter)
+            rgb = rgb + new_rgb
+        else:
+            rgb = new_rgb
+            
+        return x, rgb
+
 class SuperresolutionHybrid8XDC(torch.nn.Module):
     def __init__(self, channels, img_resolution, sr_num_fp16_res, sr_antialias, large_sr=False, lora_args=None, **block_kwargs):
         super().__init__()
@@ -338,18 +380,68 @@ class SuperresolutionHybrid8XDC(torch.nn.Module):
         self.sr_antialias = sr_antialias
         
         self.lora_args = lora_args
+        self.sr_arch = hparams.get('sr_arch', 'stylegan2')
         
-        if large_sr is True:
-            self.block0 = LargeSynthesisBlock0(channels, use_fp16=sr_num_fp16_res > 0, **block_kwargs)
-            self.block1 = LargeSynthesisBlock1(use_fp16=sr_num_fp16_res > 0, **block_kwargs)
+        self.register_buffer('resample_filter', upfirdn2d.setup_filter([1,3,3,1]))
+
+        if self.sr_arch == 'stylegan2':
+            if large_sr is True:
+                self.block0 = LargeSynthesisBlock0(channels, use_fp16=sr_num_fp16_res > 0, **block_kwargs)
+                self.block1 = LargeSynthesisBlock1(use_fp16=sr_num_fp16_res > 0, **block_kwargs)
+            else:
+                self.block0 = SynthesisBlock(channels, 256, w_dim=512, resolution=256,
+                        img_channels=3, is_last=False, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), lora_args=self.lora_args, **block_kwargs)
+                self.block1 = SynthesisBlock(256, 128, w_dim=512, resolution=512,
+                        img_channels=3, is_last=True, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), lora_args=self.lora_args, **block_kwargs)
+        elif self.sr_arch == 'stylegan3':
+            w_dim = 512
+            # Filter kwargs to be compatible with AFSynthesisLayer by creating an allowlist
+            # of arguments it can accept. This is safer than blacklisting.
+            valid_af_kwargs = [
+                'conv_kernel', 'filter_size', 'lrelu_upsampling', 'use_radial_filters',
+                'conv_clamp', 'magnitude_ema_beta'
+            ]
+            af_kwargs = {k: v for k, v in block_kwargs.items() if k in valid_af_kwargs}
+            # Force lrelu_upsampling to 1, so upsampling is controlled by sampling_rate parameters
+            af_kwargs['lrelu_upsampling'] = 1
+
+            # Define the raw alias-free layers
+            # Stage 1: 128 -> 256
+            block0_af = AFSynthesisLayer(w_dim, is_torgb=False, is_critically_sampled=False, use_fp16=use_fp16,
+                in_channels=channels, out_channels=256, in_size=128, out_size=256,
+                in_sampling_rate=128, out_sampling_rate=256, in_cutoff=64, out_cutoff=128,
+                in_half_width=64, out_half_width=128, **af_kwargs)
+            torgb0 = AFSynthesisLayer(w_dim, is_torgb=True, is_critically_sampled=False, use_fp16=use_fp16,
+                in_channels=256, out_channels=3, in_size=256, out_size=256,
+                in_sampling_rate=256, out_sampling_rate=256, in_cutoff=128, out_cutoff=128,
+                in_half_width=128, out_half_width=128, **af_kwargs)
+            
+            # Stage 2: 256 -> 512
+            block1_af = AFSynthesisLayer(w_dim, is_torgb=False, is_critically_sampled=False, use_fp16=use_fp16,
+                in_channels=256, out_channels=128, in_size=256, out_size=512,
+                in_sampling_rate=256, out_sampling_rate=512, in_cutoff=128, out_cutoff=256,
+                in_half_width=128, out_half_width=256, **af_kwargs)
+            torgb1 = AFSynthesisLayer(w_dim, is_torgb=True, is_critically_sampled=True, use_fp16=use_fp16,
+                in_channels=128, out_channels=3, in_size=512, out_size=512,
+                in_sampling_rate=512, out_sampling_rate=512, in_cutoff=256, out_cutoff=256,
+                in_half_width=256, out_half_width=256, **af_kwargs)
+
+            # Wrap the AF layers in the adapter to provide a StyleGAN2-like interface
+            self.block0 = AFBlockAdapter(block0_af, torgb0, self.resample_filter)
+            self.block1 = AFBlockAdapter(block1_af, torgb1, self.resample_filter)
         else:
-            self.block0 = SynthesisBlock(channels, 256, w_dim=512, resolution=256,
-                    img_channels=3, is_last=False, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), lora_args=self.lora_args, **block_kwargs)
-            self.block1 = SynthesisBlock(256, 128, w_dim=512, resolution=512,
-                    img_channels=3, is_last=True, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), lora_args=self.lora_args, **block_kwargs)
+            raise NotImplementedError(f"Unknown SR architecture: {self.sr_arch}")
+
 
     def forward(self, rgb, x, ws, **block_kwargs):
-        ws = ws[:, -1:, :].repeat(1, 3, 1)
+        # This forward pass now works for both StyleGAN2 and the adapted StyleGAN3 blocks
+        # as they share the same interface.
+        if self.sr_arch == 'stylegan3':
+            # StyleGAN3 adapter blocks expect 2 ws vectors each, but are called sequentially.
+            # The total ws vectors needed is 2.
+            ws = ws[:, -1:, :].repeat(1, 2, 1)
+        else: # stylegan2
+            ws = ws[:, -1:, :].repeat(1, 3, 1)
 
         if x.shape[-1] != self.input_resolution:
             x = torch.nn.functional.interpolate(x, size=(self.input_resolution, self.input_resolution),

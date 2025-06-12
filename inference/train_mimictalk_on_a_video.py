@@ -369,6 +369,7 @@ class LoRATrainer(nn.Module):
         
         # FIX: Manually update hparams to sync command-line args with the model's config
         hparams['mouth_encode_mode'] = self.inp.get('mouth_encode_mode', 'none')
+        hparams['sr_arch'] = self.inp.get('generator', 'stylegan2')
         
         hp['htbsr_head_threshold'] = 1.0
         self.neural_rendering_resolution = hp['neural_rendering_resolution']
@@ -1180,7 +1181,7 @@ if __name__ == '__main__':
     parser.add_argument("--torso_ckpt", default='checkpoints/mimictalk_orig/os_secc2plane_torso') # checkpoints/0729_th1kh/secc_img2plane checkpoints/0720_img2planes/secc_img2plane_two_stage
     parser.add_argument("--video_id", default='data/raw/examples/id2.mp4', help="identity source, we support (1) already processed <video_id> of GeneFace, (2) video path, (3) image path")
     parser.add_argument("--work_dir", default=None) 
-    parser.add_argument("--max_updates", default=4000, type=int, help="for video, 2000 is good; for an image, 3~10 is good") 
+    parser.add_argument("--max_updates", default=4001, type=int, help="for video, 2000 is good; for an image, 3~10 is good") 
     parser.add_argument("--test", action='store_true') 
     parser.add_argument("--batch_size", default=1, type=int, help="batch size during training, 1 needs 8GB, 2 needs 15GB") 
     parser.add_argument("--lr", default=0.001, type=float) 
@@ -1207,6 +1208,7 @@ if __name__ == '__main__':
     parser.add_argument("--lr_d", default=0.0001, type=float, help="learning rate for discriminators")
     parser.add_argument("--lambda_lpips", default=0.5, type=float, help="Weight for LPIPS (VGG) perceptual loss. Set to 0 to disable.")
     parser.add_argument("--lambda_sd", default=0.0, type=float, help="Weight for Stable Diffusion perceptual loss. Set to 0 to disable.")
+    parser.add_argument("--generator", default='stylegan2', choices=['stylegan2', 'stylegan3'], help="Super-resolution generator architecture.")
 
     args = parser.parse_args()
     
@@ -1252,6 +1254,7 @@ if __name__ == '__main__':
             'lr_d': args.lr_d,
             'lambda_lpips': args.lambda_lpips,
             'lambda_sd': args.lambda_sd,
+            'generator': args.generator,
             }
     if inp['work_dir'] == None:
         video_id = os.path.basename(inp['video_id'])[:-4] if inp['video_id'].endswith((".mp4", ".png", ".jpg", ".jpeg")) else inp['video_id']
@@ -1271,7 +1274,8 @@ if __name__ == '__main__':
         
         loss_suffix = ('_' + '_'.join(loss_suffix_parts)) if loss_suffix_parts else ''
         
-        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{lora_suffix}{mouth_mode_suffix}{loss_suffix}'
+        generator_suffix = f"_{inp['generator']}" if inp['generator'] != 'stylegan2' else ""
+        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{lora_suffix}{mouth_mode_suffix}{generator_suffix}{loss_suffix}'
     os.makedirs(inp['work_dir'], exist_ok=True)
     trainer = LoRATrainer(inp)
 
