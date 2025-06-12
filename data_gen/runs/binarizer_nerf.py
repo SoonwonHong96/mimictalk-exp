@@ -134,11 +134,11 @@ def get_lip_rect(lms, h, w):
 
 def get_lip_rect_from_mp(lms, h, w):
     """
-    lms: [478, 2] landmarks from mediapipe
+    lms: [468, 2] landmarks from mediapipe
     h, w: int
     return: [4,]
     """
-    assert len(lms) == 478
+    assert len(lms) == 468
     # Outer lip indices from mediapipe face mesh
     lips = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
     lms_lips = lms[lips, :]
@@ -322,13 +322,27 @@ class Binarizer:
 
 
 def get_eye_rects(lm, H, W):
-    # eye_left
-    x_min, x_max = int(lm[130, 0]), int(lm[243, 0])
-    y_min, y_max = int(lm[27, 1]), int(lm[23, 1])
-    # eye_right
-    x_min_r, x_max_r = int(lm[463, 0]), int(lm[359, 0])
-    y_min_r, y_max_r = int(lm[257, 1]), int(lm[253, 1])
-    return (x_min, x_max, y_min, y_max), (x_min_r, x_max_r, y_min_r, y_max_r)
+    """
+    lms: [68, 2]
+    h, w: int
+    return: [4,]
+    """
+    assert len(lm) == 68
+    
+    # Use the correct 68-point indices
+    # Left Eye: 36-41, Right Eye: 42-47
+    left_eye_lms = lm[36:42, :]
+    right_eye_lms = lm[42:48, :]
+
+    # Left eye bounding box
+    l_xmin, l_xmax = int(np.min(left_eye_lms[:, 0])), int(np.max(left_eye_lms[:, 0]))
+    l_ymin, l_ymax = int(np.min(left_eye_lms[:, 1])), int(np.max(left_eye_lms[:, 1]))
+    
+    # Right eye bounding box
+    r_xmin, r_xmax = int(np.min(right_eye_lms[:, 0])), int(np.max(right_eye_lms[:, 0]))
+    r_ymin, r_ymax = int(np.min(right_eye_lms[:, 1])), int(np.max(right_eye_lms[:, 1]))
+
+    return (l_xmin, l_xmax, l_ymin, l_ymax), (r_xmin, r_xmax, r_ymin, r_ymax)
 
 def create_component_masks_from_landmarks(lm2ds, H, W):
     """
@@ -336,10 +350,9 @@ def create_component_masks_from_landmarks(lm2ds, H, W):
     """
     # Define landmark indices for facial components
     # https://github.com/google/mediapipe/blob/master/mediapipe/modules/face_geometry/data/canonical_face_model_uv_visualization.png
+    # Use the OUTER lip contour to ensure the inner mouth area is included in the mask.
     LIP_INDICES = [
-        61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269,
-        267, 0, 37, 39, 40, 185, 78, 95, 88, 178, 87, 14, 317, 402, 318,
-        324, 308, 415, 310, 311, 312, 13
+        61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185
     ]
     LEFT_EYE_INDICES = [
         33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246

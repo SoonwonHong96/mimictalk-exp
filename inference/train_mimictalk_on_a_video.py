@@ -157,48 +157,86 @@ class LoRATrainer(nn.Module):
         super().__init__()
         self.inp = inp
         self.lora_args = {'lora_mode': inp['lora_mode'], 'lora_r': inp['lora_r']}
-
-    def setup(self):
-        """
-        Main setup function to orchestrate preprocessing, model loading, and data loading.
-        """
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        # 1. Run preprocessing first to ensure all files and configs are available.
-        self.auto_preprocessing(self.inp)
-
-        # 2. Load the main model now that config is guaranteed to exist.
-        head_model_dir = self.inp['head_ckpt']
-        torso_model_dir = self.inp['torso_ckpt']
+        head_model_dir = inp['head_ckpt']
+        torso_model_dir = inp['torso_ckpt']
         model_dir = torso_model_dir if torso_model_dir != '' else head_model_dir
+        cmd = f"cp {os.path.join(model_dir, 'config.yaml')} {self.inp['work_dir']}"
+        print(cmd)
+        os.system(cmd)
+        with open(os.path.join(self.inp['work_dir'], 'config.yaml'), "a") as f:
+            f.write(f"\nlora_r: {inp['lora_r']}")
+            f.write(f"\nlora_mode: {inp['lora_mode']}")
+            f.write(f"\nmouth_encode_mode: {inp['mouth_encode_mode']}")
+            f.write(f"\n")
         
-        # We need to copy the config first to set up hparams for model loading
-        config_path = os.path.join(self.inp['work_dir'], 'config.yaml')
-        if not os.path.exists(config_path):
-             cmd = f"cp {os.path.join(model_dir, 'config.yaml')} {self.inp['work_dir']}"
-             print(cmd)
-             os.system(cmd)
-             with open(config_path, "a") as f:
-                f.write(f"\nlora_r: {self.inp['lora_r']}")
-                f.write(f"\nlora_mode: {self.inp['lora_mode']}")
-                f.write(f"\nmouth_encode_mode: {self.inp['mouth_encode_mode']}")
-                f.write(f"\n")
-
-        self.secc2video_model = self.load_secc2video(model_dir)
-        self.secc2video_model.to(device).eval()
-
-        # 3. Initialize helper classes
+        # Define helpers first
         self.seg_model = MediapipeSegmenter()
         self.secc_renderer = SECC_Renderer(512)
         self.face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='lm68')
         self.mp_face3d_helper = Face3DHelper(use_gpu=True, keypoint_mode='mediapipe')
-        
-        # 4. Initialize loss functions
-        self.init_perceptual_losses(self.inp)
-        self.init_advanced_losses(self.inp)
 
-        # 5. Load the actual training data
-        self.load_training_data(self.inp)
+        # Load the main model
+        self.secc2video_model = self.load_secc2video(model_dir)
+        self.secc2video_model.to(device)
+        # print(f"self.secc2video_model: {self.secc2video_model}")
+        
+        # Now, explicitly unfreeze parameters on the correct model attribute
+        mark_only_lora_as_trainable(self.secc2video_model, bias='none')
+        if self.lora_args['lora_mode'] != 'none':
+            print(f"| Manually unfreezing LoRA parameters for mode: {self.lora_args['lora_mode']}")
+            for n, p in self.secc2video_model.named_parameters():
+                if 'lora_' in n:
+                    p.requires_grad = True
+        
+        # Also unfreeze mouth encoder params on the correct model
+        mode = self.inp.get('mouth_encode_mode', 'none')
+        if mode != 'none':
+            print(f"| Mouth encode mode is '{mode}'. Unfreezing related modules for training.")
+            sr_module = self.secc2video_model.superresolution
+            if mode == 'concat':
+                for p in sr_module.mouth_encoder_concat.parameters(): p.requires_grad = True
+                for p in sr_module.fuse_mouth_conv.parameters(): p.requires_grad = True
+            elif mode == 'add':
+                for p in sr_module.mouth_encoder_add.parameters(): p.requires_grad = True
+            elif mode == 'style_latent':
+                for p in sr_module.mouth_encoder_style.parameters(): p.requires_grad = True
+                for p in sr_module.style_fusion_layer.parameters(): p.requires_grad = True
+            elif mode == 'adain':
+                for p in sr_module.mouth_encoder_adain.parameters(): p.requires_grad = True
+                for p in sr_module.adain_param_generator.parameters(): p.requires_grad = True
+            elif mode == 'gated':
+                for p in sr_module.mouth_encoder_gated.parameters(): p.requires_grad = True
+                for p in sr_module.gating_network.parameters(): p.requires_grad = True
+            elif mode == 'film':
+                for p in sr_module.mouth_encoder_film.parameters(): p.requires_grad = True
+                for p in sr_module.film_generator.parameters(): p.requires_grad = True
+
+        # --- DEBUG: Print trainable parameters ---
+        print("-" * 50)
+        print("| Trainable Parameters:")
+        trainable_params = 0
+        not_trainable_params = 0
+        for n, p in self.secc2video_model.named_parameters():
+            if p.requires_grad:
+                print(f"|  - {n}")
+                trainable_params += p.numel()
+            else:
+                not_trainable_params += p.numel()
+        print(f"| Total Trainable Parameters: {trainable_params / 1e6:.3f}M")
+        print(f"| Total Not Trainable Parameters: {not_trainable_params / 1e6:.3f}M")
+        print("-" * 50)
+
+        
+        # --- END DEBUG ---
+        
+        self.secc2video_model.eval()
+        
+        # Now that helpers and the main model exist, run preprocessing and data loading
+        self.auto_preprocessing(inp)
+        self.init_perceptual_losses(inp)
+        self.init_advanced_losses(inp)
+        self.load_training_data(inp)
 
     def auto_preprocessing(self, inp):
         video_id = os.path.basename(inp['video_id'])
@@ -208,7 +246,7 @@ class LoRATrainer(nn.Module):
         raw_video_path = inp['video_id']
         processed_video_path = f'data/raw/videos/{video_id}.mp4'
         head_img_pattern = f'data/processed/videos/{video_id}/head_imgs/*.png'
-        coeff_path = f"data/processed/videos/{video_id}/coeff_fit_mp_for_lora.npy"
+        coeff_path = f"data/processed/videos/{video_id}/coeff_fit_mp.npy"
         lm2d_path = f'data/processed/videos/{video_id}/lms_2d.npy'
 
         # Check if all necessary files exist
@@ -250,36 +288,10 @@ class LoRATrainer(nn.Module):
             print("| Frame extraction finished.")
 
         # 3. Fit 3DMM and get landmarks. This will create both coeff_path and lm2d_path
-        # First, ensure landmarks are valid, and regenerate if necessary.
-        if os.path.exists(lm2d_path):
-            try:
-                lms = np.load(lm2d_path)
-                if lms.shape[1] < 468:
-                    print(f"| Found landmark file with incorrect shape: {lms.shape}. Regenerating.")
-                    os.remove(lm2d_path)
-                    if os.path.exists(coeff_path): os.remove(coeff_path)
-            except Exception as e:
-                print(f"| Error loading landmark file, regenerating: {e}")
-                os.remove(lm2d_path)
-                if os.path.exists(coeff_path): os.remove(coeff_path)
-
         if not os.path.exists(coeff_path) or not os.path.exists(lm2d_path):
             print("| Step 3/3: Fitting 3DMM coefficients and extracting landmarks...")
-            # Explicitly extract and save landmarks first
-            if not os.path.exists(lm2d_path):
-                print("|   Extracting landmarks...")
-                from data_gen.utils.mp_feature_extractors.face_landmarker import MediapipeLandmarker, read_video_to_frames
-                landmarker = MediapipeLandmarker()
-                frames = read_video_to_frames(processed_video_path)
-                img_lm478, vid_lm478 = landmarker.extract_lm478_from_frames(frames, anti_smooth_factor=20)
-                lms = landmarker.combine_vid_img_lm478_to_lm478(img_lm478, vid_lm478)
-                os.makedirs(os.path.dirname(lm2d_path), exist_ok=True)
-                np.save(lm2d_path, lms)
-                print(f"|   Landmarks saved to {lm2d_path}")
-
-            coeff_dict = fit_3dmm_for_a_video(processed_video_path, save=False)
-            os.makedirs(os.path.dirname(coeff_path), exist_ok=True)
-            np.save(coeff_path, coeff_dict)
+            # Set save=True to ensure lms_2d.npy is also saved by the fitting function
+            fit_3dmm_for_a_video(processed_video_path, save=True)
             print("| 3DMM fitting finished.")
         
         print("| Automatic preprocessing complete.")
@@ -287,7 +299,7 @@ class LoRATrainer(nn.Module):
     def init_perceptual_losses(self, inp):
         self.criterion_lpips, self.criterion_sd = None, None
         if inp['lambda_lpips'] > 0:
-            self.criterion_lpips = lpips.LPIPS(net='alex',lpips=True).cuda()
+            self.criterion_lpips = lpips.LPIPS(net='vgg',lpips=True).cuda()
             print(f"| LPIPS (VGG) perceptual loss enabled with weight: {inp['lambda_lpips']}")
         if inp['lambda_sd'] > 0:
             self.criterion_sd = SDPerceptualLoss(loss_weight=1.0).cuda()
@@ -366,8 +378,7 @@ class LoRATrainer(nn.Module):
         else:
             self.torso_mode = False
             model = OSAvatarSECC_Img2plane(hp=hp, lora_args=self.lora_args)
-
-        # Load checkpoint before marking parameters as trainable
+        
         lora_ckpt_path = os.path.join(inp['work_dir'], 'checkpoint.ckpt')
         if os.path.exists(lora_ckpt_path):
             self.learnable_triplane = nn.Parameter(torch.zeros([1, 3, model.triplane_hid_dim*model.triplane_depth, 256, 256]).float().cuda(), requires_grad=True)
@@ -375,53 +386,20 @@ class LoRATrainer(nn.Module):
             load_ckpt(model, lora_ckpt_path, model_name='model', strict=False)   
         else:
             load_ckpt(model, f"{model_dir}", model_name='model', strict=False)   
-        
-        # Now, mark only the LoRA parameters as trainable
-        mark_only_lora_as_trainable(model, bias='none')
-
-        mode = self.inp.get('mouth_encode_mode', 'none')
-        if mode != 'none':
-            print(f"| Mouth encode mode is '{mode}'. Unfreezing related modules for training.")
-            sr_module = model.superresolution
-            if mode == 'concat':
-                for p in sr_module.mouth_encoder_concat.parameters(): p.requires_grad = True
-                for p in sr_module.fuse_mouth_conv.parameters(): p.requires_grad = True
-            elif mode == 'add':
-                for p in sr_module.mouth_encoder_add.parameters(): p.requires_grad = True
-            elif mode == 'style_latent':
-                for p in sr_module.mouth_encoder_style.parameters(): p.requires_grad = True
-                for p in sr_module.style_fusion_layer.parameters(): p.requires_grad = True
-            elif mode == 'adain':
-                for p in sr_module.mouth_encoder_adain.parameters(): p.requires_grad = True
-                for p in sr_module.adain_param_generator.parameters(): p.requires_grad = True
-            elif mode == 'gated':
-                for p in sr_module.mouth_encoder_gated.parameters(): p.requires_grad = True
-                for p in sr_module.gating_network.parameters(): p.requires_grad = True
-            elif mode == 'film':
-                for p in sr_module.mouth_encoder_film.parameters(): p.requires_grad = True
-                for p in sr_module.film_generator.parameters(): p.requires_grad = True
-
+            
         num_params(model)
         self.model = model 
-
-        # Automatically run preprocessing if necessary
-        self.auto_preprocessing(inp)
-
-        # Initialize discriminators and advanced losses if enabled
-        self.init_perceptual_losses(inp)
-        self.init_advanced_losses(inp)
-
-        self.load_training_data(inp)
+        return model
 
     def load_training_data(self, inp):
         video_id = inp['video_id']
         if video_id.endswith((".mp4", ".png", ".jpg", ".jpeg")):
             video_id = os.path.basename(video_id)[:-4]
             inp['video_id'] = video_id
-
+            
         # All preprocessing is assumed to be done by auto_preprocessing now.
         # We just need to load the files.
-        coeff_path = f"data/processed/videos/{video_id}/coeff_fit_mp_for_lora.npy"
+        coeff_path = f"data/processed/videos/{video_id}/coeff_fit_mp.npy"
         lm2d_path = f'data/processed/videos/{video_id}/lms_2d.npy'
 
         coeff_dict = np.load(coeff_path, allow_pickle=True).tolist()
@@ -435,7 +413,7 @@ class LoRATrainer(nn.Module):
 
         if mp_lm2ds.shape[1] > 468: # Use the first 468 for consistency if 478 are present
             mp_lm2ds = mp_lm2ds[:, :468, :]
-
+        
         mouth_ref_img = None
         if self.inp.get('mouth_encode_mode', 'none') != 'none':
             # We need to use the 68-landmark subset for these specific indices
@@ -539,10 +517,7 @@ class LoRATrainer(nn.Module):
         num_main_params = sum(p.numel() for p in main_model_trainable_params)
         print(f"| Found {num_main_params} trainable parameters in the main model.")
 
-        if inp['perceptual_loss_mode'] == 'sd':
-            self.criterion_lpips = SDPerceptualLoss(loss_weight=1.0).cuda()
-        else: # vgg
-            self.criterion_lpips = lpips.LPIPS(net='alex',lpips=True).cuda()
+        # self.criterion_lpips is now initialized in init_perceptual_losses
         
         self.logger = SummaryWriter(log_dir=inp['work_dir'])
         if not hasattr(self, 'learnable_triplane'):
@@ -649,6 +624,14 @@ class LoRATrainer(nn.Module):
                         img = torch.tensor(cv2.imread(img_name)[..., ::-1] / 127.5 - 1).permute(2,0,1).float() # [3, H, W]
                         self.ds['head_imgs'][di] = img
                     gt_imgs.append(self.ds['head_imgs'][di])
+                
+                # The head_imgs list must always be populated for the head losses
+                if self.ds['head_imgs'][di] is None:
+                    img_name = f'data/processed/videos/{video_id}/head_imgs/{format(di, "08d")}.png'
+                    img = torch.tensor(cv2.imread(img_name)[..., ::-1] / 127.5 - 1).permute(2,0,1).float() # [3, H, W]
+                    self.ds['head_imgs'][di] = img
+                head_imgs.append(self.ds['head_imgs'][di])
+
                 # 使用第一帧的torso作为face v2v的输入
                 if self.ds['torso_imgs'][0] is None:
                     img_name = f'data/processed/videos/{video_id}/inpaint_torso_imgs/{format(0, "08d")}.png'
@@ -753,7 +736,7 @@ class LoRATrainer(nn.Module):
                         lip_lpips_loss += self.criterion_lpips(lip_pred_imgs, lip_tgt_imgs).mean()
                     if self.criterion_sd:
                         lip_sd_loss += self.criterion_sd(lip_pred_imgs, lip_tgt_imgs)
-                except: pass
+                except: pass 
 
                 # Eye mask for component loss - This part is now simplified
                 # (l_xmin, l_xmax, l_ymin, l_ymax), (r_xmin, r_xmax, r_ymin, r_ymax) = drv_eye_rects[i]
@@ -913,13 +896,14 @@ class LoRATrainer(nn.Module):
 
             meter.update(total_loss.item())
             if i_step % 10 == 0:
-                log_line = f"Iter {i_step+1}: total_loss={meter.avg} "
+                log_line = f"Iter {i_step+1}: total_loss={meter.avg:.3f} "
                 for k, v in losses.items():
                     val = v.item() if isinstance(v, torch.Tensor) else v
-                    log_line = log_line + f" {k}={val}, "
+                    log_line = log_line + f" {k}={val:.3f}, "
                     self.logger.add_scalar(f"train/{k}", val, i_step)
                 print(log_line)
                 meter.reset()
+                
     @torch.no_grad()
     def test_loop(self, inp, step=''):
         self.model.eval()
@@ -939,6 +923,8 @@ class LoRATrainer(nn.Module):
         lip_debug_canvas_size = (max_w * 2, max_h)
         lip_video_writer = imageio.get_writer(os.path.join(inp['work_dir'], f'val_step{step}_mouth_segmented.mp4'), fps=25)
         masked_comp_video_writer = imageio.get_writer(os.path.join(inp['work_dir'], f'val_step{step}_masked_components.mp4'), fps=25)
+        lip_mask_video_writer = imageio.get_writer(os.path.join(inp['work_dir'], f'val_step{step}_lip_mask.mp4'), fps=25)
+        eye_mask_video_writer = imageio.get_writer(os.path.join(inp['work_dir'], f'val_step{step}_eye_mask.mp4'), fps=25)
 
         total_iters = min(num_samples, 250)
         video_id = inp['video_id']
@@ -985,7 +971,7 @@ class LoRATrainer(nn.Module):
                 # Get the pre-computed mouth mask for the current frame
                 mouth_masks_for_batch.append(self.ds['lip_masks'][di])
                 eye_masks_for_batch.append(self.ds['eye_masks'][di])
-                
+
                 drv_lip_rects.append(self.ds['lip_rects'][di])
                 drv_eye_rects.append(self.ds['eye_rects'][di])
                 kp_src.append(self.ds['kps'][0])
@@ -1030,14 +1016,27 @@ class LoRATrainer(nn.Module):
             cv2.putText(canvas, 'Pred', (max_w + 10, 20), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
             lip_video_writer.append_data(canvas)
 
+            # Save mask videos by applying them to the ground truth image
+            lip_mask_applied = tgt_imgs.clone()
+            lip_mask_applied[self.ds['lip_masks'][i:i+1].cuda().repeat(1,3,1,1) == 0] = -1
+            lip_mask_frame = ((lip_mask_applied[0].permute(1, 2, 0) + 1) / 2 * 255).int().cpu().numpy().astype(np.uint8)
+
+            eye_mask_applied = tgt_imgs.clone()
+            eye_mask_applied[self.ds['eye_masks'][i:i+1].cuda().repeat(1,3,1,1) == 0] = -1
+            eye_mask_frame = ((eye_mask_applied[0].permute(1, 2, 0) + 1) / 2 * 255).int().cpu().numpy().astype(np.uint8)
+
+            lip_mask_video_writer.append_data(lip_mask_frame)
+            eye_mask_video_writer.append_data(eye_mask_frame)
+
             # Create and write masked components debug frame
             combined_mask = (self.ds['lip_masks'][i:i+1] + self.ds['eye_masks'][i:i+1]).clamp(0, 1).cuda()
             gt_masked = tgt_imgs * combined_mask
             pred_masked = pred_img * combined_mask
             
             # Make unmasked area black for visualization
-            gt_masked[combined_mask == 0] = -1
-            pred_masked[combined_mask == 0] = -1
+            expanded_mask = combined_mask.repeat(1, 3, 1, 1)
+            gt_masked[expanded_mask == 0] = -1
+            pred_masked[expanded_mask == 0] = -1
 
             combined_masked_frame = torch.cat([gt_masked, pred_masked], dim=-1)
             combined_masked_frame_np = ((combined_masked_frame[0].permute(1, 2, 0) + 1) / 2 * 255).int().cpu().numpy().astype(np.uint8)
@@ -1048,6 +1047,8 @@ class LoRATrainer(nn.Module):
         video_writer.close()
         lip_video_writer.close()
         masked_comp_video_writer.close()
+        lip_mask_video_writer.close()
+        eye_mask_video_writer.close()
         self.model.train()
         # Optional unseen-audio validation
         if step != '':
@@ -1169,7 +1170,7 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", default=1, type=int, help="batch size during training, 1 needs 8GB, 2 needs 15GB") 
     parser.add_argument("--lr", default=0.001, type=float) 
     parser.add_argument("--lr_triplane", default=0.005, type=float, help="for video, 0.1; for an image, 0.001; for ablation with_triplane, 0.") 
-    parser.add_argument("--lora_r", default=2, type=int, help="width of lora unit") 
+    parser.add_argument("--lora_r", default=64, type=int, help="width of lora unit") 
     parser.add_argument("--lora_mode", default='secc2plane_sr', help='for video, full; for an image, none')
     parser.add_argument("--offset_x", default=424, type=int, help="x offset for face cropping")
     parser.add_argument("--offset_y", default=60, type=int, help="y offset for face cropping")
@@ -1242,6 +1243,10 @@ if __name__ == '__main__':
         
         # Create a descriptive suffix based on enabled losses for automatic work_dir naming
         lora_suffix = f"_lora_{inp['lora_mode']}_rank_{inp['lora_r']}"
+        
+        mouth_mode_suffix = ""
+        if inp['mouth_encode_mode'] != 'none':
+            mouth_mode_suffix = f"_mouth_{inp['mouth_encode_mode']}"
 
         loss_suffix_parts = []
         if inp['adv_loss_fns']:
@@ -1251,10 +1256,9 @@ if __name__ == '__main__':
         
         loss_suffix = ('_' + '_'.join(loss_suffix_parts)) if loss_suffix_parts else ''
         
-        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{lora_suffix}{loss_suffix}'
+        inp['work_dir'] = f'checkpoints_mimictalk/{video_id}{lora_suffix}{mouth_mode_suffix}{loss_suffix}'
     os.makedirs(inp['work_dir'], exist_ok=True)
     trainer = LoRATrainer(inp)
-    trainer.setup() # Call the new setup method
 
     # Initialize the gating network bias if in 'gated' mode
     if inp['mouth_encode_mode'] == 'gated':

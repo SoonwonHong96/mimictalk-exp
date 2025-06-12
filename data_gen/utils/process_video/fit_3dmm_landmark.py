@@ -130,7 +130,7 @@ def set_requires_grad(tensor_list):
 @torch.enable_grad()
 def fit_3dmm_for_a_video(
     video_name, 
-    nerf=False, # use the file name convention for GeneFace++
+    nerf=True, # use the file name convention for GeneFace++
     id_mode='global', 
     debug=True, 
     keypoint_mode='mediapipe',
@@ -169,22 +169,13 @@ def fit_3dmm_for_a_video(
             landmarker = MediapipeLandmarker()
             img_lm478, vid_lm478 = landmarker.extract_lm478_from_frames(frames, anti_smooth_factor=20)
             lms = landmarker.combine_vid_img_lm478_to_lm478(img_lm478, vid_lm478)
+            if lms is not None:
+                os.makedirs(os.path.dirname(lm_name), exist_ok=True)
+                np.save(lm_name, lms)
+                print(f"| Saved landmarks to {lm_name}")
         except Exception as e:
             print(e)
             return False
-        if lms is None:
-            print(f"ERROR: Could not extract landmarks from video: {video_name}. Please ensure the video contains a clearly visible face in all frames.")
-            raise RuntimeError(f"Landmark extraction failed for {video_name}")
-    
-    if lms.shape[1] < 468:
-        error_msg = (
-            f"ERROR: Loaded landmark file '{lm_name}' has an incorrect number of landmarks. "
-            f"Expected >= 468, but got {lms.shape[1]}.\n"
-            f"This usually means you are using a cached, old landmark file from a previous run.\n"
-            f"SOLUTION: Please delete the directory 'data/processed/videos/<video_id>' for this specific video and re-run the script."
-        )
-        raise ValueError(error_msg)
-
     lms = lms[:, :468, :]
     lms = torch.FloatTensor(lms).cuda()
     lms[..., 1] = img_h - lms[..., 1] # flip the height axis
@@ -370,6 +361,10 @@ def fit_3dmm_for_a_video(
     coeff_dict = {'id': id_para.detach().cpu().numpy(), 'exp': exp_para.detach().cpu().numpy(),
                 'euler': euler_angle.detach().cpu().numpy(), 'trans': trans.detach().cpu().numpy()}
 
+    if save:
+        np.save(out_name, coeff_dict, allow_pickle=True)
+        print(f"| Saved 3DMM coefficients to {out_name}")
+
     # filter data by side-view pose    
     # bad_yaw = False
     # yaws = [] # not so accurate
@@ -465,8 +460,6 @@ def fit_3dmm_for_a_video(
     #     print(f"Skip {video_name} due to TOO LARGE YAW")
     #     return False
 
-    if save:
-        np.save(out_name, coeff_dict, allow_pickle=True) 
     return coeff_dict
 
 def out_exist_job(vid_name):

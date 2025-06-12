@@ -329,21 +329,24 @@ class LargeSynthesisBlock1(nn.Module):
         return x, rgb
     
 class SuperresolutionHybrid8XDC(torch.nn.Module):
-    def __init__(self, channels, img_resolution, sr_num_fp16_res, sr_antialias, large_sr=False, **block_kwargs):
+    def __init__(self, channels, img_resolution, sr_num_fp16_res, sr_antialias, large_sr=False, lora_args=None, **block_kwargs):
         super().__init__()
         assert img_resolution == 512
 
         use_fp16 = sr_num_fp16_res > 0
         self.input_resolution = 128
         self.sr_antialias = sr_antialias
+        
+        self.lora_args = lora_args
+        
         if large_sr is True:
             self.block0 = LargeSynthesisBlock0(channels, use_fp16=sr_num_fp16_res > 0, **block_kwargs)
             self.block1 = LargeSynthesisBlock1(use_fp16=sr_num_fp16_res > 0, **block_kwargs)
         else:
             self.block0 = SynthesisBlock(channels, 256, w_dim=512, resolution=256,
-                    img_channels=3, is_last=False, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), **block_kwargs)
+                    img_channels=3, is_last=False, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), lora_args=self.lora_args, **block_kwargs)
             self.block1 = SynthesisBlock(256, 128, w_dim=512, resolution=512,
-                    img_channels=3, is_last=True, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), **block_kwargs)
+                    img_channels=3, is_last=True, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), lora_args=self.lora_args, **block_kwargs)
 
     def forward(self, rgb, x, ws, **block_kwargs):
         ws = ws[:, -1:, :].repeat(1, 3, 1)

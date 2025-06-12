@@ -30,7 +30,7 @@ class OSAvatarSECC_Img2plane(OSAvatar_Img2plane):
         # extract canonical triplane from src img
         self.cano_img2plane_backbone = self.img2plane_backbone # rename
         del self.img2plane_backbone
-        lora_args_secc2plane = lora_args if (lora_args and lora_args.get("lora_mode", 'none') == 'all' or 'secc2plane' in lora_args.get("lora_mode", 'none')) else None
+        lora_args_secc2plane = lora_args if (lora_args and (lora_args.get("lora_mode", 'none') == 'all' or lora_args.get("lora_mode", 'none') == 'full' or 'secc2plane' in lora_args.get("lora_mode", 'none'))) else None
         if lora_args_secc2plane:
             print("lora_args_secc2plane: ", lora_args_secc2plane)
         self.secc_img2plane_backbone = SegFormerSECC2PlaneBackbone(mode=hparams.get('secc_segformer_scale','b0'), out_channels=3*self.triplane_hid_dim*self.triplane_depth, pncc_cond_mode=hparams['pncc_cond_mode'], lora_args=lora_args_secc2plane)
