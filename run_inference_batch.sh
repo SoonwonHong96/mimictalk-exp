@@ -24,7 +24,7 @@ do
   echo "----------------------------------------------------"
   echo "Processing video: $video_file"
   echo "----------------------------------------------------"
-  python "$SCRIPT_PATH" --video_id "$video_file"
+  python "$SCRIPT_PATH" --lora_r 2 --video_id "$video_file"
   
   # Check the exit code of the python script
   if [ $? -ne 0 ]; then
