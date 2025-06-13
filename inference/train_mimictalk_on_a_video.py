@@ -1165,9 +1165,24 @@ class LoRATrainer(nn.Module):
             f"--a2m_ckpt {a2m_ckpt} "
             f"--torso_ckpt \"{inp['work_dir']}\" " # Pass the specific checkpoint file
             f"--drv_aud \"{val_audio}\" "
-            f"--drv_pose data/raw/examples/German_20s.mp4 "
+            f"--drv_pose \"{inp['video_id']}\" "
+            f"--drv_style \"{inp['video_id']}\" "
             f"--out_mode concat_debug "
             f"--out_name \"{out_name}\" "
+            f"--map_to_init_pose True --temperature 0.3 --denoising_steps 20"
+        )
+        print(f"| Running audio validation: {cmd}")
+        os.system(cmd)
+
+        cmd = (
+            f"python inference/mimictalk_infer.py "
+            f"--a2m_ckpt {a2m_ckpt} "
+            f"--torso_ckpt \"{inp['work_dir']}\" " # Pass the specific checkpoint file
+            f"--drv_aud \"{val_audio}\" "
+            f"--drv_pose \"{inp['video_id']}\" "
+            f"--drv_style \"{inp['video_id']}\" "
+            f"--out_mode concat_debug "
+            f"--out_name \"{out_name}_full\" "
             f"--map_to_init_pose True --temperature 0.3 --denoising_steps 20"
         )
         print(f"| Running audio validation: {cmd}")
