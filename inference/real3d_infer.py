@@ -134,9 +134,10 @@ class GeneFace2Infer:
             audio_in_dim = 1024
         elif self.audio2secc_hparams['audio_type'] == 'mfcc':
             audio_in_dim = 13
-
+        
         if 'icl' in hparams['task_cls']:
             self.use_icl_audio2motion = True
+            
             model = InContextAudio2MotionModel(hparams['icl_model_type'], hparams=self.audio2secc_hparams)
         else:
             self.use_icl_audio2motion = False
@@ -379,6 +380,8 @@ class GeneFace2Infer:
 
     @torch.no_grad()
     def forward_audio2secc(self, batch, inp=None):
+        print(f"parent")
+        exit()
         if inp['drv_audio_name'][-4:] in ['.wav', '.mp3']:
             from inference.infer_utils import extract_audio_motion_from_ref_video
             if self.use_icl_audio2motion:
@@ -565,6 +568,7 @@ class GeneFace2Infer:
         
     @torch.no_grad()
     def forward_system(self, batch, inp):
+        print(f"hi")
         self.forward_audio2secc(batch, inp)
         out_fname = self.forward_secc2video(batch, inp)
         return out_fname

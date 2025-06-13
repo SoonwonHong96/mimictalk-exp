@@ -201,7 +201,7 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
             lora_args = ckpt.get("lora_args", None)
             from modules.real3d.secc_img2plane_torso import OSAvatarSECC_Img2plane_Torso
             model = OSAvatarSECC_Img2plane_Torso(self.secc2video_hparams, lora_args=lora_args)
-            load_ckpt(model, f"{torso_model_dir}", model_name='model', strict=True)
+            load_ckpt(model, f"{torso_model_dir}", model_name='model', strict=False)
             self.learnable_triplane = nn.Parameter(torch.zeros([1, 3, model.triplane_hid_dim*model.triplane_depth, 256, 256]).float().cuda(), requires_grad=True)
             load_ckpt(self.learnable_triplane, f"{torso_model_dir}", model_name='learnable_triplane', strict=True)
             model._last_cano_planes = self.learnable_triplane
@@ -403,10 +403,17 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
         """
         # audio-to-exp
         ret = {}
+        if self.use_icl_audio2motion and inp['drv_talking_style_name'].endswith(".mp4"):
+            print(f"this is called")
+            from inference.infer_utils import extract_audio_motion_from_ref_video
+            ref_exp, ref_hubert, ref_f0 = extract_audio_motion_from_ref_video(inp['drv_talking_style_name'])
+            self.audio2secc_model.add_sample_to_context(ref_exp, ref_hubert, ref_f0)
+        
         if self.use_icl_audio2motion:
-            pred = self.audio2secc_model.forward(batch, ret=ret,train=False)
+            # here
+            pred = self.audio2secc_model.forward(batch, ret=ret,train=False, denoising_steps=inp['denoising_steps'], cond_scale=inp['cfg_scale'])
         else:
-            pred = self.audio2secc_model.forward(batch, ret=ret,train=False, temperature=inp['temperature'])
+            pred = self.audio2secc_model.forward(batch, ret=ret,train=False, temperature=inp['temperature'], denoising_steps=inp['denoising_steps'], cond_scale=inp['cfg_scale'])
     
         if pred.shape[-1] == 144:
             id = ret['pred'][0][:,:80]
@@ -426,6 +433,8 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
                 exp[:5] = smoothed[5:10]
 
             self.previous_exp = exp[-5:].detach().clone()
+        else:
+            print(f"no smoothing")
 
         if inp.get('drv_motion_coeff_dict', None) is not None:
             pass
@@ -600,8 +609,8 @@ if __name__ == '__main__':
     parser.add_argument("--torso_ckpt", default='checkpoints_mimictalk/German_20s') 
     parser.add_argument("--bg_img", default='') # data/raw/val_imgs/bg3.png
     parser.add_argument("--drv_aud", default='data/raw/examples/80_vs_60_10s.wav')
-    parser.add_argument("--drv_pose", default='data/raw/examples/German_20s.mp4') # nearest | topk | random | static | vid_name
-    parser.add_argument("--drv_style", default='data/raw/examples/angry.mp4') # nearest | topk | random | static | vid_name
+    parser.add_argument("--drv_pose", default='data/raw/examples/id2_512.mp4') #this is used for add_sample_to_context, nearest | topk | random | static | vid_name
+    parser.add_argument("--drv_style", default='data/raw/examples/id2_512.mp4') # nearest | topk | random | static | vid_name
     parser.add_argument("--blink_mode", default='period') # none | period
     parser.add_argument("--temperature", default=0.3, type=float) # nearest | random
     parser.add_argument("--denoising_steps", default=20, type=int) # nearest | random
