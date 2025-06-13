@@ -1181,7 +1181,7 @@ class LoRATrainer(nn.Module):
             f"--drv_aud \"{val_audio}\" "
             f"--drv_pose \"{inp['video_id']}\" "
             f"--drv_style \"{inp['video_id']}\" "
-            f"--out_mode concat_debug "
+            f"--out_mode full "
             f"--out_name \"{out_name}_full\" "
             f"--map_to_init_pose True --temperature 0.3 --denoising_steps 20"
         )
@@ -1213,7 +1213,7 @@ if __name__ == '__main__':
     parser.add_argument("--random_seed", default=None, type=int, help="random seed for reproducibility")
     parser.add_argument("--preprocess_only", action='store_true', help="run preprocessing only and exit")
     parser.add_argument("--mouth_encode_mode", default='none', choices=['none', 'concat', 'add', 'style_latent', 'adain', 'gated', 'film'], help="choose the mouth feature injection mode for the SR module")
-    parser.add_argument("--a2m_ckpt", default='checkpoints/240112_icl_audio2secc_vox2_cmlr', help="checkpoint directory of audio2secc model, if provided test_loop will run unseen audio validation")
+    parser.add_argument("--a2m_ckpt", default='checkpoints/audio2motion_vae', help="checkpoint directory of audio2secc model, if provided test_loop will run unseen audio validation")
     parser.add_argument("--val_audio", default='data/raw/examples/10s.wav', help="path to an unseen audio file for additional validation during training")
     # Advanced Loss arguments - New flexible system
     parser.add_argument("--adv_loss_fns", default="", type=str, help="Space-separated list of advanced loss functions to use (e.g., 'gan gan_lip fsm_lip comp_lp comp_lp_eye comp_lp_lip').")

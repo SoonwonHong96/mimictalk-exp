@@ -604,7 +604,7 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
 if __name__ == '__main__':
     import argparse, glob, tqdm
     parser = argparse.ArgumentParser()
-    parser.add_argument("--a2m_ckpt", default='checkpoints/240112_icl_audio2secc_vox2_cmlr') # checkpoints/0727_audio2secc/audio2secc_withlm2d100_randomframe
+    parser.add_argument("--a2m_ckpt", default='/home/ubuntu/mimictalk_exp/checkpoints/audio2motion_vae') # checkpoints/0727_audio2secc/audio2secc_withlm2d100_randomframe
     parser.add_argument("--head_ckpt", default='') # checkpoints/0729_th1kh/secc_img2plane checkpoints/0720_img2planes/secc_img2plane_two_stage
     parser.add_argument("--torso_ckpt", default='checkpoints_mimictalk/German_20s') 
     parser.add_argument("--bg_img", default='') # data/raw/val_imgs/bg3.png
