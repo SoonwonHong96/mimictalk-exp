@@ -259,6 +259,7 @@ class LoRATrainer(nn.Module):
 
         print("| Some processed files are missing. Running automatic preprocessing...")
         
+        
         # 1. Crop and rescale video
         if not os.path.exists(processed_video_path):
             print("| Step 1/3: Cropping and resizing video...")
@@ -271,7 +272,7 @@ class LoRATrainer(nn.Module):
             rescale_video(cropped_16by9_file, rescaled_video_file, scale_width=1360, scale_height=764)
             crop_face_area(rescaled_video_file, processed_video_path, crop_size=512, 
                            offset_x=inp['offset_x'], offset_y=inp['offset_y'])
-            shutil.rmtree(temp_dir)
+            
             print("| Video preprocessing finished.")
         
         # 2. Extract frames, segmentation, and background
@@ -1159,14 +1160,15 @@ class LoRATrainer(nn.Module):
             return
 
         # Compose command for quick validation
+        print(f"video_path: {inp['video_path']}")
         out_name = os.path.join(inp['work_dir'], f"val_audio_step{step}.mp4")
         cmd = (
             f"python inference/mimictalk_infer.py "
             f"--a2m_ckpt {a2m_ckpt} "
             f"--torso_ckpt \"{inp['work_dir']}\" " # Pass the specific checkpoint file
             f"--drv_aud \"{val_audio}\" "
-            f"--drv_pose \"{inp['video_id']}\" "
-            f"--drv_style \"{inp['video_id']}\" "
+            f"--drv_pose \"{inp['video_path'].replace('examples', 'videos')}\" "
+            f"--drv_style \"{inp['video_path'].replace('examples', 'videos')}\" "
             f"--out_mode concat_debug "
             f"--out_name \"{out_name}\" "
             f"--map_to_init_pose True --temperature 0.3 --denoising_steps 20"
@@ -1179,8 +1181,8 @@ class LoRATrainer(nn.Module):
             f"--a2m_ckpt {a2m_ckpt} "
             f"--torso_ckpt \"{inp['work_dir']}\" " # Pass the specific checkpoint file
             f"--drv_aud \"{val_audio}\" "
-            f"--drv_pose \"{inp['video_id']}\" "
-            f"--drv_style \"{inp['video_id']}\" "
+            f"--drv_pose \"{inp['video_path'].replace('examples', 'videos')}\" "
+            f"--drv_style \"{inp['video_path'].replace('examples', 'videos')}\" "
             f"--out_mode full "
             f"--out_name \"{out_name}_full\" "
             f"--map_to_init_pose True --temperature 0.3 --denoising_steps 20"
@@ -1272,6 +1274,7 @@ if __name__ == '__main__':
             'lambda_sd': args.lambda_sd,
             'generator': args.generator,
             'large_sr': args.large_sr,
+            'video_path': args.video_id,
             }
     if inp['work_dir'] == None:
         video_id = os.path.basename(inp['video_id'])[:-4] if inp['video_id'].endswith((".mp4", ".png", ".jpg", ".jpeg")) else inp['video_id']
