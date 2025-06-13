@@ -1183,8 +1183,8 @@ class LoRATrainer(nn.Module):
             f"--drv_aud \"{val_audio}\" "
             f"--drv_pose \"{inp['video_path'].replace('examples', 'videos')}\" "
             f"--drv_style \"{inp['video_path'].replace('examples', 'videos')}\" "
-            f"--out_mode full "
-            f"--out_name \"{out_name}_full\" "
+            f"--out_mode final "
+            f"--out_name \"full_{out_name}\" "
             f"--map_to_init_pose True --temperature 0.3 --denoising_steps 20"
         )
         print(f"| Running audio validation: {cmd}")
