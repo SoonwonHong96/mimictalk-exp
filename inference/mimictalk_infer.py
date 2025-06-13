@@ -403,17 +403,17 @@ class AdaptGeneFace2Infer(GeneFace2Infer):
         """
         # audio-to-exp
         ret = {}
-        if self.use_icl_audio2motion and inp['drv_talking_style_name'].endswith(".mp4"):
-            print(f"this is called")
-            from inference.infer_utils import extract_audio_motion_from_ref_video
-            ref_exp, ref_hubert, ref_f0 = extract_audio_motion_from_ref_video(inp['drv_talking_style_name'])
-            self.audio2secc_model.add_sample_to_context(ref_exp, ref_hubert, ref_f0)
+        # if self.use_icl_audio2motion and inp['drv_talking_style_name'].endswith(".mp4"):
+        #     print(f"this is called")
+        #     from inference.infer_utils import extract_audio_motion_from_ref_video
+        #     ref_exp, ref_hubert, ref_f0 = extract_audio_motion_from_ref_video(inp['drv_talking_style_name'])
+        #     self.audio2secc_model.add_sample_to_context(ref_exp, ref_hubert, ref_f0)
         
         if self.use_icl_audio2motion:
             # here
             pred = self.audio2secc_model.forward(batch, ret=ret,train=False, denoising_steps=inp['denoising_steps'], cond_scale=inp['cfg_scale'])
         else:
-            pred = self.audio2secc_model.forward(batch, ret=ret,train=False, temperature=inp['temperature'], denoising_steps=inp['denoising_steps'], cond_scale=inp['cfg_scale'])
+            pred = self.audio2secc_model.forward(batch, ret=ret,train=False, temperature=inp['temperature'])
     
         if pred.shape[-1] == 144:
             id = ret['pred'][0][:,:80]
@@ -616,7 +616,7 @@ if __name__ == '__main__':
     parser.add_argument("--denoising_steps", default=20, type=int) # nearest | random
     parser.add_argument("--cfg_scale", default=1.5, type=float) # nearest | random
     parser.add_argument("--out_name", default='') # nearest | random
-    parser.add_argument("--out_mode", default='concat_debug') # concat_debug | debug | final 
+    parser.add_argument("--out_mode", default='final') # concat_debug | debug | final 
     parser.add_argument("--hold_eye_opened", default='False') # concat_debug | debug | final 
     parser.add_argument("--map_to_init_pose", default='True') # concat_debug | debug | final 
     parser.add_argument("--seed", default=None, type=int) # random seed, default None to use time.time()

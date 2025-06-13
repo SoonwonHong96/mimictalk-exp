@@ -135,16 +135,19 @@ class GeneFace2Infer:
         elif self.audio2secc_hparams['audio_type'] == 'mfcc':
             audio_in_dim = 13
         
-        if 'icl' in hparams['task_cls']:
+        if False:#'icl' in hparams['task_cls']:
             self.use_icl_audio2motion = True
             
             model = InContextAudio2MotionModel(hparams['icl_model_type'], hparams=self.audio2secc_hparams)
         else:
             self.use_icl_audio2motion = False
             if hparams.get("use_pitch", False) is True:
+                print(f"PitchContourVAEModel") # here
                 model = PitchContourVAEModel(hparams, in_out_dim=64, audio_in_dim=audio_in_dim)
             else:
+                
                 model = VAEModel(in_out_dim=64, audio_in_dim=audio_in_dim)
+            
         load_ckpt(model, f"{audio2secc_dir}", model_name='model', strict=True)
         return model
 
@@ -263,6 +266,8 @@ class GeneFace2Infer:
         sample['bg_img'] = ((torch.tensor(bg_img) - 127.5)/127.5).float().unsqueeze(0).permute(0, 3, 1,2).cuda() # [b,c,h,w]
 
         # 3DMM, get identity code and camera pose
+        print(f"image_name: {image_name}")
+        exit()
         coeff_dict = fit_3dmm_for_a_image(image_name, save=False)
         assert coeff_dict is not None
         src_id = torch.tensor(coeff_dict['id']).reshape([1,80]).cuda()
