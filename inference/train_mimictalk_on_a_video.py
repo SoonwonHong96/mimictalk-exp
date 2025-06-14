@@ -416,6 +416,9 @@ class LoRATrainer(nn.Module):
         if mp_lm2ds.shape[1] > 468: # Use the first 468 for consistency if 478 are present
             mp_lm2ds = mp_lm2ds[:, :468, :]
         
+        # Create tight component masks using the new utility
+        lip_masks, eye_masks = create_component_masks_from_landmarks(mp_lm2ds, WH, WH)
+
         mouth_ref_img = None
         if self.inp.get('mouth_encode_mode', 'none') != 'none':
             # We need to use the 68-landmark subset for these specific indices
@@ -432,34 +435,27 @@ class LoRATrainer(nn.Module):
             if os.path.exists(mouth_ref_img_name):
                 full_ref_img_bgr = cv2.imread(mouth_ref_img_name)
                 
-                # Get the y-coordinate of the nose tip (landmark 33) and crop below it.
-                nose_tip_y = lm68_for_lip_dist[mouth_open_idx, 33, 1]
-                crop_y_start = int(nose_tip_y)
-                
-                # Ensure crop start is within image bounds
-                if crop_y_start < 0: crop_y_start = 0
-                if crop_y_start >= full_ref_img_bgr.shape[0]: crop_y_start = full_ref_img_bgr.shape[0] - 1
-                
-                # Create a black background and copy the lower part of the face onto it.
-                cropped_img_bgr = np.zeros_like(full_ref_img_bgr)
-                cropped_img_bgr[crop_y_start:, :, :] = full_ref_img_bgr[crop_y_start:, :, :]
+                # Get the tight lip mask for the reference frame
+                lip_mask_for_ref = lip_masks[mouth_open_idx].cpu().numpy() # [1, H, W]
+                lip_mask_for_ref_bgr = np.stack([lip_mask_for_ref[0]]*3, axis=-1) # [H, W, 3]
 
-                # Convert the cropped image to a tensor for the model.
-                mouth_ref_img = torch.tensor(cropped_img_bgr[..., ::-1].copy() / 127.5 - 1).permute(2, 0, 1).float()
+                # Create a black background and copy the lip region onto it.
+                masked_lip_img_bgr = np.zeros_like(full_ref_img_bgr)
+                masked_lip_img_bgr[lip_mask_for_ref_bgr > 0] = full_ref_img_bgr[lip_mask_for_ref_bgr > 0]
+
+                # Convert the masked image to a tensor for the model.
+                mouth_ref_img = torch.tensor(masked_lip_img_bgr[..., ::-1].copy() / 127.5 - 1).permute(2, 0, 1).float()
                 
-                # Save the chosen CROPPED image for verification.
-                save_path = os.path.join(self.inp['work_dir'], 'mouth_reference_frame_cropped.png')
-                cv2.imwrite(save_path, cropped_img_bgr)
-                print(f"| Saved CROPPED mouth reference frame to {save_path}")
+                # Save the chosen MASKED image for verification.
+                save_path = os.path.join(self.inp['work_dir'], 'mouth_reference_frame_masked.png')
+                cv2.imwrite(save_path, masked_lip_img_bgr)
+                print(f"| Saved MASKED mouth reference frame to {save_path}")
             else:
                 print(f"| WARNING: Could not find mouth reference image: {mouth_ref_img_name}")
 
         kps = self.face3d_helper.reconstruct_lm2d(ids, exps, eulers, trans).cuda()
         kps = (kps-0.5) / 0.5 # rescale to -1~1
         kps = torch.cat([kps, torch.zeros([*kps.shape[:-1], 1]).cuda()], dim=-1)
-        
-        # Create tight component masks using the new utility
-        lip_masks, eye_masks = create_component_masks_from_landmarks(mp_lm2ds, WH, WH)
         
         camera_ret = get_eg3d_convention_camera_pose_intrinsic({'euler': torch.tensor(coeff_dict['euler']).reshape([-1,3]), 'trans': torch.tensor(coeff_dict['trans']).reshape([-1,3])})
         c2w, intrinsics = camera_ret['c2w'], camera_ret['intrinsics']
